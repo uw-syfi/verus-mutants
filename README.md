@@ -18,7 +18,7 @@ metadata or `verus!` source, and verifies each package with
 ## Install and use
 
 ```sh
-cargo install --git https://github.com/uw-syfi/verus-mutants
+cargo install cargo-verus-mutants
 cd my-verus-workspace
 
 # Inspect the deterministic mutant inventory without running Verus.
