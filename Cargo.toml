@@ -1,0 +1,36 @@
+[package]
+name = "cargo-verus-mutants"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Mutation analysis for Verus Cargo projects"
+repository = "https://github.com/uw-syfi/verus-mutants"
+readme = "README.md"
+keywords = ["verus", "verification", "mutation-testing"]
+categories = ["development-tools::testing"]
+
+# Keep the tool independent from any workspace in the project being analyzed.
+[workspace]
+
+[[bin]]
+name = "cargo-verus-mutants"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+cargo_metadata = "0.19"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+globset = "0.4"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+toml = "0.8"
+walkdir = "2"
+wait-timeout = "0.2"
+verus_syn = { git = "https://github.com/verus-lang/verus.git", rev = "3a4d30bcdc4571e7927af97be9c4664973083eda", package = "verus_syn", features = ["full", "visit", "extra-traits"] }
+
+[dev-dependencies]
+pretty_assertions = "1"
