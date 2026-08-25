@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "kebab-case")]
 pub enum Campaign {
     Exec,
+    Rust,
     Manual,
 }
 
@@ -26,6 +27,8 @@ pub struct OracleSpec {
     pub command: Vec<String>,
     #[serde(default)]
     pub expected_pattern: Option<String>,
+    #[serde(default)]
+    pub invalid_pattern: Option<String>,
     #[serde(default)]
     pub required_test_count: Option<usize>,
 }

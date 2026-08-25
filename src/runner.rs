@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -14,6 +15,7 @@ use crate::materialize;
 use crate::model::{Mutant, MutantResult, Outcome, RunSummary};
 use crate::oracle;
 use crate::report;
+use crate::rust;
 
 pub fn list(manifest: &Path, json: bool) -> Result<()> {
     let loaded = config::load(manifest)?;
@@ -21,15 +23,53 @@ pub fn list(manifest: &Path, json: bool) -> Result<()> {
     report::print_list(&mutants, json)
 }
 
-pub fn run(
-    manifest: &Path,
-    json: bool,
-    manual_only: bool,
-    automatic_only: bool,
-    fail_fast: bool,
-    limit: Option<usize>,
-    selected_ids: &[String],
-) -> Result<()> {
+pub struct RunOptions<'a> {
+    pub manifest: &'a Path,
+    pub json: bool,
+    pub manual_only: bool,
+    pub automatic_only: bool,
+    pub fail_fast: bool,
+    pub limit: Option<usize>,
+    pub selected_ids: &'a [String],
+    pub selected_operators: &'a [String],
+    pub limit_per_operator: Option<usize>,
+    pub exhaustive_operators: &'a [String],
+    pub minimum_kill_rate: Option<f64>,
+    pub zero_survivor_operators: &'a [String],
+    pub in_diff: Option<&'a str>,
+    pub selected_files: &'a [PathBuf],
+    pub jobs: usize,
+}
+
+pub fn run(options: RunOptions<'_>) -> Result<()> {
+    let RunOptions {
+        manifest,
+        json,
+        manual_only,
+        automatic_only,
+        fail_fast,
+        limit,
+        selected_ids,
+        selected_operators,
+        limit_per_operator,
+        exhaustive_operators,
+        minimum_kill_rate,
+        zero_survivor_operators,
+        in_diff,
+        selected_files,
+        jobs,
+    } = options;
+    anyhow::ensure!(jobs > 0, "--jobs must be greater than zero");
+    anyhow::ensure!(
+        jobs == 1 || !fail_fast,
+        "--fail-fast is supported only with --jobs 1"
+    );
+    if let Some(rate) = minimum_kill_rate {
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&rate),
+            "--minimum-kill-rate must be between 0 and 1"
+        );
+    }
     let loaded = config::load(manifest)?;
     let root = &loaded.root;
     let mut mutants = discover_all(&loaded, manual_only, automatic_only)?;
@@ -43,47 +83,209 @@ pub fn run(
             "selected mutant IDs were not found: {missing:?}"
         );
     }
+    if !selected_operators.is_empty() {
+        let selected: BTreeSet<_> = selected_operators.iter().collect();
+        mutants.retain(|mutant| selected.contains(&mutant.operator));
+        let found: BTreeSet<_> = mutants.iter().map(|mutant| &mutant.operator).collect();
+        let missing: Vec<_> = selected.difference(&found).collect();
+        anyhow::ensure!(
+            missing.is_empty(),
+            "selected automatic operators were not found: {missing:?}"
+        );
+    }
+    if let Some(reference) = in_diff {
+        let changed = changed_files_since(root, reference)?;
+        let exhaustive: BTreeSet<_> = exhaustive_operators.iter().collect();
+        mutants.retain(|mutant| {
+            exhaustive.contains(&mutant.operator) || changed.contains(&mutant.file)
+        });
+    }
+    if !selected_files.is_empty() {
+        let selected: BTreeSet<_> = selected_files.iter().collect();
+        let exhaustive: BTreeSet<_> = exhaustive_operators.iter().collect();
+        mutants.retain(|mutant| {
+            exhaustive.contains(&mutant.operator) || selected.contains(&mutant.file)
+        });
+    }
+    if let Some(per_operator) = limit_per_operator {
+        let exhaustive: BTreeSet<_> = exhaustive_operators.iter().collect();
+        let mut retained = BTreeMap::new();
+        mutants.retain(|mutant| {
+            if exhaustive.contains(&mutant.operator) {
+                return true;
+            }
+            let count = retained
+                .entry((mutant.package.clone(), mutant.operator.clone()))
+                .or_insert(0usize);
+            if *count >= per_operator {
+                false
+            } else {
+                *count += 1;
+                true
+            }
+        });
+    }
     if let Some(limit) = limit {
         mutants.truncate(limit);
     }
     anyhow::ensure!(!mutants.is_empty(), "no mutants discovered");
     let digest = source_digest(root)?;
-    let output_root = root.join("target/verus-mutants");
-    let log_root = output_root.join("logs");
+    let log_root = root.join("target/verus-mutants/logs");
     fs::create_dir_all(&log_root)?;
+    let worker_count = jobs.min(mutants.len());
+    let mut assignments = vec![Vec::new(); worker_count];
+    for (index, mutant) in mutants.into_iter().enumerate() {
+        assignments[index % worker_count].push(mutant);
+    }
+    let mut results =
+        if worker_count == 1 {
+            execute_worker(
+                0,
+                root,
+                assignments.pop().expect("one worker assignment"),
+                &loaded.config.verification,
+                fail_fast,
+            )?
+        } else {
+            std::thread::scope(|scope| -> Result<Vec<MutantResult>> {
+                let mut handles = Vec::new();
+                for (worker, assignment) in assignments.into_iter().enumerate() {
+                    let verification = &loaded.config.verification;
+                    handles.push(scope.spawn(move || {
+                        execute_worker(worker, root, assignment, verification, false)
+                    }));
+                }
+                let mut combined = Vec::new();
+                for handle in handles {
+                    combined.extend(
+                        handle
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("mutation worker panicked"))??,
+                    );
+                }
+                Ok(combined)
+            })?
+        };
+    results.sort_by(|left, right| left.mutant.id.cmp(&right.mutant.id));
+    let summary = RunSummary {
+        schema_version: 1,
+        source_digest: digest,
+        results,
+    };
+    report::publish(root, &summary, json)?;
+    if summary
+        .results
+        .iter()
+        .any(|result| result.outcome == Outcome::InfrastructureFailure)
+    {
+        anyhow::bail!("one or more mutation oracles failed for infrastructure reasons");
+    }
+    if summary
+        .results
+        .iter()
+        .any(|result| result.outcome == Outcome::Timeout)
+    {
+        anyhow::bail!("one or more mutants timed out");
+    }
+    let killed = summary
+        .results
+        .iter()
+        .filter(|result| {
+            matches!(
+                result.outcome,
+                Outcome::KilledByProof | Outcome::KilledByTest | Outcome::KilledByPolicy
+            )
+        })
+        .count();
+    let survived = summary
+        .results
+        .iter()
+        .filter(|result| result.outcome == Outcome::Survived)
+        .count();
+    let required: BTreeSet<_> = zero_survivor_operators.iter().collect();
+    let observed_operators: BTreeSet<_> = summary
+        .results
+        .iter()
+        .map(|result| &result.mutant.operator)
+        .collect();
+    let missing_required: Vec<_> = required.difference(&observed_operators).collect();
+    anyhow::ensure!(
+        missing_required.is_empty(),
+        "required zero-survivor operators were not selected: {missing_required:?}"
+    );
+    let critical_survivors: Vec<_> = summary
+        .results
+        .iter()
+        .filter(|result| {
+            result.outcome == Outcome::Survived && required.contains(&result.mutant.operator)
+        })
+        .map(|result| result.mutant.id.as_str())
+        .collect();
+    anyhow::ensure!(
+        critical_survivors.is_empty(),
+        "required operators have surviving mutants: {critical_survivors:?}"
+    );
+    if let Some(required) = minimum_kill_rate {
+        let observed = if killed + survived == 0 {
+            1.0
+        } else {
+            killed as f64 / (killed + survived) as f64
+        };
+        anyhow::ensure!(
+            observed >= required,
+            "mutation kill rate {observed:.3} is below required {required:.3}"
+        );
+    } else if survived > 0 {
+        anyhow::bail!("one or more mutants survived");
+    }
+    Ok(())
+}
 
-    let commands = unique_commands(&mutants, &loaded.config.verification)?;
+fn execute_worker(
+    worker: usize,
+    root: &Path,
+    mutants: Vec<Mutant>,
+    verification: &config::VerificationConfig,
+    fail_fast: bool,
+) -> Result<Vec<MutantResult>> {
+    let sandbox = TempDir::new().context("creating campaign worker sandbox")?;
+    let source = sandbox.path().join("source");
+    let target = sandbox.path().join("target");
+    materialize::copy_project(root, &source)?;
+    let log_root = root.join("target/verus-mutants/logs");
+    let commands = baseline_commands(&mutants, verification)?;
     for (key, baseline) in &commands {
         let command = &baseline.command;
-        eprintln!("baseline: {}", command.join(" "));
-        let sandbox = TempDir::new().context("creating baseline sandbox")?;
-        let source = sandbox.path().join("source");
-        let target = sandbox.path().join("target");
-        materialize::copy_project(root, &source)?;
+        eprintln!("worker {worker} baseline: {}", command.join(" "));
         let output = oracle::baseline(
             &source,
             &target,
             command,
-            loaded.config.verification.timeout_seconds,
+            verification.timeout_seconds,
             &baseline.kind,
             baseline.required_test_count,
         )?;
-        fs::write(log_root.join(format!("baseline-{key}.log")), output)?;
+        fs::write(
+            log_root.join(format!("baseline-worker-{worker}-{key}.log")),
+            output,
+        )?;
     }
 
     let mut results = Vec::new();
     for mutant in mutants {
-        eprintln!("mutant {}: {}", mutant.id, mutant.operator);
-        let sandbox = TempDir::new().context("creating mutant sandbox")?;
-        let source = sandbox.path().join("source");
-        let target = sandbox.path().join("target");
-        materialize::copy_project(root, &source)?;
+        eprintln!("worker {worker} mutant {}: {}", mutant.id, mutant.operator);
+        let mutated_path = source.join(&mutant.file);
+        let original_source = fs::read(&mutated_path)
+            .with_context(|| format!("reading {} before mutation", mutated_path.display()))?;
         materialize::apply(&source, &mutant)?;
-        let execution = oracle::execute(&source, &target, &mutant, &loaded.config.verification)?;
+        let execution = oracle::execute(&source, &target, &mutant, verification);
+        fs::write(&mutated_path, original_source)
+            .with_context(|| format!("restoring {} after mutation", mutated_path.display()))?;
+        let execution = execution?;
         let log = PathBuf::from(format!("target/verus-mutants/logs/{}.log", mutant.id));
         fs::write(root.join(&log), &execution.output)?;
         eprintln!(
-            "  {:?} ({:.2}s)",
+            "worker {worker}   {:?} ({:.2}s)",
             execution.outcome, execution.elapsed_seconds
         );
         let stop = matches!(
@@ -103,27 +305,44 @@ pub fn run(
             break;
         }
     }
-    let summary = RunSummary {
-        schema_version: 1,
-        source_digest: digest,
-        results,
+    Ok(results)
+}
+
+fn changed_files_since(root: &Path, reference: &str) -> Result<BTreeSet<PathBuf>> {
+    let output = |arguments: &[&str]| -> Result<String> {
+        let result = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(arguments)
+            .output()
+            .context("running git for diff-scoped mutation discovery")?;
+        anyhow::ensure!(
+            result.status.success(),
+            "git {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&result.stderr).trim()
+        );
+        Ok(String::from_utf8(result.stdout)?.trim().to_owned())
     };
-    report::publish(root, &summary, json)?;
-    if summary
-        .results
-        .iter()
-        .any(|result| result.outcome == Outcome::InfrastructureFailure)
-    {
-        anyhow::bail!("one or more mutation oracles failed for infrastructure reasons");
+    let top = PathBuf::from(output(&["rev-parse", "--show-toplevel"])?);
+    let root = root.canonicalize()?;
+    let base = output(&["merge-base", reference, "HEAD"])?;
+    let tracked = output(&["diff", "--name-only", "--diff-filter=ACMR", &base, "--"])?;
+    let untracked = output(&[
+        "ls-files",
+        "--full-name",
+        "--others",
+        "--exclude-standard",
+        "--",
+    ])?;
+    let mut changed = BTreeSet::new();
+    for relative in tracked.lines().chain(untracked.lines()) {
+        let path = top.join(relative);
+        if let Ok(workspace_relative) = path.strip_prefix(&root) {
+            changed.insert(workspace_relative.to_path_buf());
+        }
     }
-    if summary
-        .results
-        .iter()
-        .any(|result| matches!(result.outcome, Outcome::Survived | Outcome::Timeout))
-    {
-        anyhow::bail!("one or more mutants survived or timed out");
-    }
-    Ok(())
+    Ok(changed)
 }
 
 fn discover_all(
@@ -157,6 +376,10 @@ fn discover_all(
             &loaded.root,
             &verified,
             &loaded.config,
+        )?);
+        mutants.extend(rust::automatic_mutants(
+            &loaded.root,
+            &loaded.config.rust_mutants,
         )?);
     }
     if !automatic_only {
@@ -200,16 +423,46 @@ fn unique_commands(
     Ok(commands)
 }
 
+fn baseline_commands(
+    mutants: &[Mutant],
+    verification: &config::VerificationConfig,
+) -> Result<BTreeMap<String, Baseline>> {
+    let mut commands = unique_commands(mutants, verification)?;
+    if verification.baseline_command.is_empty()
+        || !mutants
+            .iter()
+            .any(|mutant| mutant.oracle.kind == crate::model::OracleKind::Verus)
+    {
+        return Ok(commands);
+    }
+    commands.retain(|_, baseline| baseline.kind != crate::model::OracleKind::Verus);
+    let encoded = serde_json::to_vec(&(
+        &verification.baseline_command,
+        &crate::model::OracleKind::Verus,
+        Option::<usize>::None,
+    ))?;
+    let key = hex::encode(Sha256::digest(encoded));
+    commands.insert(
+        key[..12].to_string(),
+        Baseline {
+            command: verification.baseline_command.clone(),
+            kind: crate::model::OracleKind::Verus,
+            required_test_count: None,
+        },
+    );
+    Ok(commands)
+}
+
 fn source_digest(root: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
-    for entry in WalkDir::new(root).follow_links(false) {
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !digest_excluded(root, entry.path()))
+    {
         let entry = entry?;
         let relative = entry.path().strip_prefix(root)?;
-        if relative.components().any(|part| {
-            let part = part.as_os_str();
-            part == ".git" || part == "target" || part == ".verus-mutants"
-        }) || !entry.file_type().is_file()
-        {
+        if !entry.file_type().is_file() {
             continue;
         }
         hasher.update(relative.to_string_lossy().as_bytes());
@@ -218,6 +471,15 @@ fn source_digest(root: &Path) -> Result<String> {
         hasher.update([0]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn digest_excluded(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root).is_ok_and(|relative| {
+        relative.components().any(|part| {
+            let part = part.as_os_str();
+            part == ".git" || part == "target" || part == ".verus-mutants"
+        })
+    })
 }
 
 #[cfg(test)]

@@ -9,13 +9,14 @@ use sha2::{Digest, Sha256};
 use verus_syn::spanned::Spanned;
 use verus_syn::visit::{self, Visit};
 use verus_syn::{
-    Assert, AssertForall, Assume, BinOp, Expr, ExprBinary, ExprClosure, ExprIf, ExprUnary,
-    ExprWhile, FnMode, ImplItemFn, ItemFn, ItemMacro, RevealHide, UnOp,
+    Assert, AssertForall, Assume, BinOp, Expr, ExprBinary, ExprClosure, ExprIf, ExprLit, ExprMatch,
+    ExprStruct, ExprUnary, ExprWhile, FnMode, ImplItemFn, ItemFn, ItemMacro, Lit, RevealHide, Stmt,
+    UnOp, Visibility,
 };
 use walkdir::WalkDir;
 
 use crate::cargo::WorkspacePackage;
-use crate::config::{Config, OperatorsConfig};
+use crate::config::{Config, ManualOracleConfig, OperatorsConfig};
 use crate::model::{Campaign, Mutant, OracleKind, OracleSpec};
 
 pub fn automatic_mutants(
@@ -62,6 +63,7 @@ pub fn automatic_mutants(
                     package,
                     &relative,
                     &config.operators,
+                    &config.operator_oracles,
                     &excluded_functions,
                     &mut mutants,
                 )?;
@@ -93,6 +95,7 @@ fn discover_file(
     package: &WorkspacePackage,
     relative: &Path,
     operators: &OperatorsConfig,
+    operator_oracles: &std::collections::BTreeMap<String, ManualOracleConfig>,
     excluded_functions: &GlobSet,
     mutants: &mut Vec<Mutant>,
 ) -> Result<()> {
@@ -110,6 +113,7 @@ fn discover_file(
         relative,
         source: &source,
         operators,
+        operator_oracles,
         excluded_functions,
         mutants,
     };
@@ -123,6 +127,7 @@ struct VerusMacroVisitor<'a> {
     relative: &'a Path,
     source: &'a str,
     operators: &'a OperatorsConfig,
+    operator_oracles: &'a std::collections::BTreeMap<String, ManualOracleConfig>,
     excluded_functions: &'a GlobSet,
     mutants: &'a mut Vec<Mutant>,
 }
@@ -143,6 +148,7 @@ impl<'ast> Visit<'ast> for VerusMacroVisitor<'_> {
                         relative: self.relative,
                         source: self.source,
                         operators: self.operators,
+                        operator_oracles: self.operator_oracles,
                         excluded_functions: self.excluded_functions,
                         mutants: self.mutants,
                         function: None,
@@ -165,6 +171,7 @@ struct ExecVisitor<'a> {
     relative: &'a Path,
     source: &'a str,
     operators: &'a OperatorsConfig,
+    operator_oracles: &'a std::collections::BTreeMap<String, ManualOracleConfig>,
     excluded_functions: &'a GlobSet,
     mutants: &'a mut Vec<Mutant>,
     function: Option<String>,
@@ -173,6 +180,10 @@ struct ExecVisitor<'a> {
 impl ExecVisitor<'_> {
     fn in_exec(mode: &FnMode) -> bool {
         matches!(mode, FnMode::Default | FnMode::Exec(_))
+    }
+
+    fn in_spec(mode: &FnMode) -> bool {
+        matches!(mode, FnMode::Spec(_) | FnMode::SpecChecked(_))
     }
 
     fn add(&mut self, span: Span, operator: &str, replacement: String) {
@@ -203,6 +214,17 @@ impl ExecVisitor<'_> {
             "VM-{}",
             &hex::encode(Sha256::digest(identity.as_bytes()))[..16]
         );
+        let oracle = self.operator_oracles.get(operator).map_or_else(
+            || OracleSpec {
+                kind: OracleKind::Verus,
+                package: Some(self.package.name.clone()),
+                command: Vec::new(),
+                expected_pattern: None,
+                invalid_pattern: None,
+                required_test_count: None,
+            },
+            |override_spec| override_spec.to_spec(&self.package.name),
+        );
         self.mutants.push(Mutant {
             id,
             campaign: Campaign::Exec,
@@ -215,13 +237,7 @@ impl ExecVisitor<'_> {
             original,
             replacement,
             expected_occurrences: 1,
-            oracle: OracleSpec {
-                kind: OracleKind::Verus,
-                package: Some(self.package.name.clone()),
-                command: Vec::new(),
-                expected_pattern: None,
-                required_test_count: None,
-            },
+            oracle,
         });
     }
 
@@ -233,28 +249,82 @@ impl ExecVisitor<'_> {
             self.add(expr.span(), "condition-to-false", "false".into());
         }
     }
+
+    fn widen_external_body_visibility(
+        &mut self,
+        attributes: &[verus_syn::Attribute],
+        visibility: &Visibility,
+        fn_span: Span,
+    ) {
+        if !self.operators.external_body_visibility_widening || !has_external_body(attributes) {
+            return;
+        }
+        match visibility {
+            Visibility::Public(_) => {}
+            Visibility::Restricted(_) => {
+                self.add(
+                    visibility.span(),
+                    "widen-external-body-visibility",
+                    "pub".into(),
+                );
+            }
+            Visibility::Inherited => {
+                self.add(fn_span, "widen-external-body-visibility", "pub fn".into());
+            }
+        }
+    }
 }
 
 impl<'ast> Visit<'ast> for ExecVisitor<'_> {
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
-        if !Self::in_exec(&node.sig.mode)
+        if !(Self::in_exec(&node.sig.mode)
+            || self.operators.mutate_spec_functions && Self::in_spec(&node.sig.mode))
             || self.excluded_functions.is_match(node.sig.ident.to_string())
         {
             return;
         }
         let previous = self.function.replace(node.sig.ident.to_string());
-        visit::visit_block(self, &node.block);
+        self.widen_external_body_visibility(&node.attrs, &node.vis, node.sig.fn_token.span());
+        let external = has_external_body(&node.attrs);
+        if self.operators.external_body_insertion && !external {
+            self.add(
+                node.sig.fn_token.span(),
+                "insert-external-body",
+                "#[verifier::external_body]\nfn".into(),
+            );
+        }
+        if self.operators.mutate_contracts {
+            visit::visit_signature(self, &node.sig);
+        }
+        if !external {
+            visit::visit_block(self, &node.block);
+        }
         self.function = previous;
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
-        if !Self::in_exec(&node.sig.mode)
+        if !(Self::in_exec(&node.sig.mode)
+            || self.operators.mutate_spec_functions && Self::in_spec(&node.sig.mode))
             || self.excluded_functions.is_match(node.sig.ident.to_string())
         {
             return;
         }
         let previous = self.function.replace(node.sig.ident.to_string());
-        visit::visit_block(self, &node.block);
+        self.widen_external_body_visibility(&node.attrs, &node.vis, node.sig.fn_token.span());
+        let external = has_external_body(&node.attrs);
+        if self.operators.external_body_insertion && !external {
+            self.add(
+                node.sig.fn_token.span(),
+                "insert-external-body",
+                "#[verifier::external_body]\nfn".into(),
+            );
+        }
+        if self.operators.mutate_contracts {
+            visit::visit_signature(self, &node.sig);
+        }
+        if !external {
+            visit::visit_block(self, &node.block);
+        }
         self.function = previous;
     }
 
@@ -310,7 +380,92 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
                 );
             }
         }
+        if self.operators.arithmetic_replacement {
+            let replacement = match &node.op {
+                BinOp::Add(_) => Some("-"),
+                BinOp::Sub(_) => Some("+"),
+                BinOp::AddAssign(_) => Some("-="),
+                BinOp::SubAssign(_) => Some("+="),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                self.add(
+                    node.op.span(),
+                    "replace-arithmetic-operator",
+                    replacement.into(),
+                );
+            }
+        }
         visit::visit_expr_binary(self, node);
+    }
+
+    fn visit_expr_lit(&mut self, node: &'ast ExprLit) {
+        match &node.lit {
+            Lit::Bool(value) if self.operators.boolean_literal_replacement => {
+                self.add(
+                    node.span(),
+                    "replace-boolean-literal",
+                    (!value.value).to_string(),
+                );
+            }
+            Lit::Int(value) if self.operators.integer_literal_replacement => {
+                let digits = value.base10_digits();
+                let replacement = if digits == "0" { "1" } else { "0" };
+                self.add(
+                    node.span(),
+                    "replace-integer-literal",
+                    format!("{replacement}{}", value.suffix()),
+                );
+            }
+            _ => {}
+        }
+        visit::visit_expr_lit(self, node);
+    }
+
+    fn visit_stmt(&mut self, node: &'ast Stmt) {
+        if self.operators.statement_deletion {
+            if let Stmt::Expr(expression, _) = node {
+                if matches!(
+                    expression,
+                    Expr::Call(_) | Expr::MethodCall(_) | Expr::Assign(_)
+                ) {
+                    self.add(node.span(), "delete-executable-statement", "()".into());
+                }
+            }
+        }
+        visit::visit_stmt(self, node);
+    }
+
+    fn visit_expr_struct(&mut self, node: &'ast ExprStruct) {
+        if self.operators.struct_field_value_substitution && node.fields.len() > 1 {
+            for (index, field) in node.fields.iter().enumerate() {
+                let replacement = &node.fields[(index + 1) % node.fields.len()].expr;
+                if let Some((start, end)) = byte_range(self.source, replacement.span()) {
+                    self.add(
+                        field.expr.span(),
+                        "substitute-struct-field-value",
+                        self.source[start..end].into(),
+                    );
+                }
+            }
+        }
+        visit::visit_expr_struct(self, node);
+    }
+
+    fn visit_expr_match(&mut self, node: &'ast ExprMatch) {
+        if self.operators.match_arm_body_substitution && node.arms.len() > 1 {
+            for (index, arm) in node.arms.iter().enumerate() {
+                let replacement = &node.arms[(index + 1) % node.arms.len()].body;
+                if let Some((start, end)) = byte_range(self.source, replacement.span()) {
+                    self.add(
+                        arm.body.span(),
+                        "substitute-match-arm-body",
+                        self.source[start..end].into(),
+                    );
+                }
+            }
+        }
+        visit::visit_expr_match(self, node);
     }
 
     fn visit_expr_unary(&mut self, node: &'ast ExprUnary) {
@@ -338,6 +493,16 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
     fn visit_reveal_hide(&mut self, _node: &'ast RevealHide) {}
 }
 
+fn has_external_body(attributes: &[verus_syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute
+            .path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "external_body")
+    })
+}
+
 fn byte_range(source: &str, span: Span) -> Option<(usize, usize)> {
     let start = byte_offset(source, span.start())?;
     let end = byte_offset(source, span.end())?;
@@ -363,6 +528,7 @@ mod tests {
     use crate::cargo::WorkspacePackage;
     use crate::config::OperatorsConfig;
     use proc_macro2::LineColumn;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
 
@@ -390,11 +556,14 @@ use vstd::prelude::*;
 verus! {
 spec fn model(x: int) -> bool { x < 10 }
 proof fn lemma(x: int) { assert(x < 20); }
+#[verifier::external_body]
+pub(crate) fn foreign(x: i32) -> i32 { x }
 fn ignored(x: i32) -> bool { x < 100 }
 fn check(x: i32) -> bool
     requires x < 30,
 {
-    if x < 5 { x == 0 } else { false }
+    let y = match x { 0 => 1, _ => 2 };
+    if x < 5 { y == 0 } else { false }
 }
 }
 "#,
@@ -412,6 +581,7 @@ fn check(x: i32) -> bool
             &package,
             &PathBuf::from("src/lib.rs"),
             &OperatorsConfig::default(),
+            &Default::default(),
             &build_globs(&[]).unwrap(),
             &mut mutants,
         )
@@ -421,6 +591,61 @@ fn check(x: i32) -> bool
             .iter()
             .all(|mutant| matches!(mutant.function.as_deref(), Some("check" | "ignored"))));
         assert!(mutants.iter().all(|mutant| mutant.start > 100));
+        let operators: BTreeSet<_> = mutants
+            .iter()
+            .map(|mutant| mutant.operator.as_str())
+            .collect();
+        assert!(operators.contains("replace-integer-literal"));
+        assert!(operators.contains("replace-boolean-literal"));
+        assert!(operators.contains("substitute-match-arm-body"));
+        let executable_relations = mutants
+            .iter()
+            .filter(|mutant| {
+                mutant.function.as_deref() == Some("check")
+                    && mutant.operator == "replace-relational-operator"
+            })
+            .count();
+
+        let assurance = OperatorsConfig {
+            mutate_contracts: true,
+            mutate_spec_functions: true,
+            external_body_visibility_widening: true,
+            ..OperatorsConfig::default()
+        };
+        let mut assurance_mutants = Vec::new();
+        discover_file(
+            directory.path(),
+            &package,
+            &PathBuf::from("src/lib.rs"),
+            &assurance,
+            &Default::default(),
+            &build_globs(&[]).unwrap(),
+            &mut assurance_mutants,
+        )
+        .unwrap();
+        assert!(assurance_mutants
+            .iter()
+            .any(|mutant| mutant.function.as_deref() == Some("model")));
+        assert!(assurance_mutants.iter().any(|mutant| {
+            mutant.function.as_deref() == Some("foreign")
+                && mutant.operator == "widen-external-body-visibility"
+                && mutant.original == "pub(crate)"
+                && mutant.replacement == "pub"
+        }));
+        assert!(assurance_mutants.iter().all(|mutant| {
+            mutant.function.as_deref() != Some("foreign")
+                || mutant.operator == "widen-external-body-visibility"
+        }));
+        assert!(
+            assurance_mutants
+                .iter()
+                .filter(|mutant| {
+                    mutant.function.as_deref() == Some("check")
+                        && mutant.operator == "replace-relational-operator"
+                })
+                .count()
+                > executable_relations
+        );
 
         let mut excluded = Vec::new();
         discover_file(
@@ -428,6 +653,7 @@ fn check(x: i32) -> bool
             &package,
             &PathBuf::from("src/lib.rs"),
             &OperatorsConfig::default(),
+            &Default::default(),
             &build_globs(&["check".into(), "ignored".into()]).unwrap(),
             &mut excluded,
         )

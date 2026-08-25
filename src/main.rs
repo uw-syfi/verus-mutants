@@ -6,6 +6,7 @@ mod model;
 mod oracle;
 mod report;
 mod runner;
+mod rust;
 
 use std::path::PathBuf;
 
@@ -25,7 +26,7 @@ enum Command {
     /// Discover mutants without executing their oracles.
     List(CommonArgs),
     /// Execute mutants. This is the default command.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
 }
 
 #[derive(Debug, clap::Args)]
@@ -57,6 +58,30 @@ struct RunArgs {
     /// Run only this mutant ID. May be repeated.
     #[arg(long = "mutant")]
     mutants: Vec<String>,
+    /// Run only this automatic operator. May be repeated.
+    #[arg(long = "operator")]
+    operators: Vec<String>,
+    /// Retain at most this many mutants per package/operator pair.
+    #[arg(long)]
+    limit_per_operator: Option<usize>,
+    /// Do not apply --limit-per-operator to this operator. May be repeated.
+    #[arg(long = "exhaustive-operator")]
+    exhaustive_operators: Vec<String>,
+    /// Accept survivors when the killed/(killed+survived) ratio meets this value.
+    #[arg(long)]
+    minimum_kill_rate: Option<f64>,
+    /// Require every selected mutant for this operator to be killed. May be repeated.
+    #[arg(long = "require-zero-survivors-for")]
+    zero_survivor_operators: Vec<String>,
+    /// Mutate only files changed since the merge base with this Git revision.
+    #[arg(long)]
+    in_diff: Option<String>,
+    /// Mutate this workspace-relative file. May be repeated.
+    #[arg(long = "file")]
+    files: Vec<PathBuf>,
+    /// Number of isolated mutation workers.
+    #[arg(long, default_value_t = 1)]
+    jobs: usize,
 }
 
 fn main() -> Result<()> {
@@ -67,7 +92,7 @@ fn main() -> Result<()> {
     }
     let cli = Cli::parse_from(args);
     match cli.command.unwrap_or_else(|| {
-        Command::Run(RunArgs {
+        Command::Run(Box::new(RunArgs {
             common: CommonArgs {
                 manifest_path: PathBuf::from("."),
                 json: false,
@@ -77,17 +102,33 @@ fn main() -> Result<()> {
             fail_fast: false,
             limit: None,
             mutants: Vec::new(),
-        })
+            operators: Vec::new(),
+            limit_per_operator: None,
+            exhaustive_operators: Vec::new(),
+            minimum_kill_rate: None,
+            zero_survivor_operators: Vec::new(),
+            in_diff: None,
+            files: Vec::new(),
+            jobs: 1,
+        }))
     }) {
         Command::List(args) => runner::list(&args.manifest_path, args.json),
-        Command::Run(args) => runner::run(
-            &args.common.manifest_path,
-            args.common.json,
-            args.manual_only,
-            args.automatic_only,
-            args.fail_fast,
-            args.limit,
-            &args.mutants,
-        ),
+        Command::Run(args) => runner::run(runner::RunOptions {
+            manifest: &args.common.manifest_path,
+            json: args.common.json,
+            manual_only: args.manual_only,
+            automatic_only: args.automatic_only,
+            fail_fast: args.fail_fast,
+            limit: args.limit,
+            selected_ids: &args.mutants,
+            selected_operators: &args.operators,
+            limit_per_operator: args.limit_per_operator,
+            exhaustive_operators: &args.exhaustive_operators,
+            minimum_kill_rate: args.minimum_kill_rate,
+            zero_survivor_operators: &args.zero_survivor_operators,
+            in_diff: args.in_diff.as_deref(),
+            selected_files: &args.files,
+            jobs: args.jobs,
+        }),
     }
 }

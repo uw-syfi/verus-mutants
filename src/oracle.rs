@@ -173,6 +173,13 @@ fn classify(
         OracleKind::Command => {
             if mutant
                 .oracle
+                .invalid_pattern
+                .as_ref()
+                .is_some_and(|pattern| output.contains(pattern))
+            {
+                (Outcome::Invalid, mutant.oracle.invalid_pattern.clone())
+            } else if mutant
+                .oracle
                 .expected_pattern
                 .as_ref()
                 .is_some_and(|pattern| output.contains(pattern))
@@ -274,6 +281,7 @@ mod tests {
                 package: None,
                 command: Vec::new(),
                 expected_pattern: None,
+                invalid_pattern: None,
                 required_test_count: None,
             },
         }

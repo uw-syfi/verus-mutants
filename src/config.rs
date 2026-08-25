@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,8 @@ pub struct Config {
     pub project: ProjectConfig,
     pub verification: VerificationConfig,
     pub operators: OperatorsConfig,
+    pub operator_oracles: BTreeMap<String, ManualOracleConfig>,
+    pub rust_mutants: RustMutantsConfig,
     #[serde(rename = "manual_mutant")]
     pub manual_mutants: Vec<ManualMutantConfig>,
 }
@@ -40,6 +43,7 @@ impl Default for ProjectConfig {
 #[serde(default)]
 pub struct VerificationConfig {
     pub command: Vec<String>,
+    pub baseline_command: Vec<String>,
     pub timeout_seconds: u64,
 }
 
@@ -53,6 +57,7 @@ impl Default for VerificationConfig {
                 "-p".into(),
                 "{package}".into(),
             ],
+            baseline_command: Vec::new(),
             timeout_seconds: 240,
         }
     }
@@ -61,19 +66,39 @@ impl Default for VerificationConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct OperatorsConfig {
+    pub mutate_contracts: bool,
+    pub mutate_spec_functions: bool,
     pub condition_to_true: bool,
     pub condition_to_false: bool,
     pub logical_clause_deletion: bool,
     pub relational_replacement: bool,
+    pub boolean_literal_replacement: bool,
+    pub integer_literal_replacement: bool,
+    pub arithmetic_replacement: bool,
+    pub statement_deletion: bool,
+    pub struct_field_value_substitution: bool,
+    pub match_arm_body_substitution: bool,
+    pub external_body_insertion: bool,
+    pub external_body_visibility_widening: bool,
 }
 
 impl Default for OperatorsConfig {
     fn default() -> Self {
         Self {
+            mutate_contracts: false,
+            mutate_spec_functions: false,
             condition_to_true: true,
             condition_to_false: true,
             logical_clause_deletion: true,
             relational_replacement: true,
+            boolean_literal_replacement: true,
+            integer_literal_replacement: true,
+            arithmetic_replacement: true,
+            statement_deletion: true,
+            struct_field_value_substitution: true,
+            match_arm_body_substitution: true,
+            external_body_insertion: false,
+            external_body_visibility_widening: false,
         }
     }
 }
@@ -104,7 +129,33 @@ pub struct ManualOracleConfig {
     #[serde(default)]
     pub expected_pattern: Option<String>,
     #[serde(default)]
+    pub invalid_pattern: Option<String>,
+    #[serde(default)]
     pub required_test_count: Option<usize>,
+}
+
+impl ManualOracleConfig {
+    pub fn to_spec(&self, default_package: &str) -> OracleSpec {
+        OracleSpec {
+            kind: self.kind.clone(),
+            package: self
+                .package
+                .clone()
+                .or_else(|| Some(default_package.to_owned())),
+            command: self.command.clone(),
+            expected_pattern: self.expected_pattern.clone(),
+            invalid_pattern: self.invalid_pattern.clone(),
+            required_test_count: self.required_test_count,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct RustMutantsConfig {
+    pub enabled: bool,
+    pub inventory_command: Vec<String>,
+    pub oracle: Option<ManualOracleConfig>,
 }
 
 fn one() -> usize {
@@ -178,6 +229,7 @@ impl ManualMutantConfig {
             package: None,
             command: Vec::new(),
             expected_pattern: None,
+            invalid_pattern: None,
             required_test_count: None,
         });
         Ok(Mutant {
@@ -197,6 +249,7 @@ impl ManualMutantConfig {
                 package: oracle.package,
                 command: oracle.command,
                 expected_pattern: oracle.expected_pattern,
+                invalid_pattern: oracle.invalid_pattern,
                 required_test_count: oracle.required_test_count,
             },
         })
