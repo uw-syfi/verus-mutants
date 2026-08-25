@@ -11,7 +11,7 @@ use verus_syn::visit::{self, Visit};
 use verus_syn::{
     Assert, AssertForall, Assume, BinOp, Expr, ExprBinary, ExprClosure, ExprIf, ExprLit, ExprMatch,
     ExprStruct, ExprUnary, ExprWhile, FnMode, ImplItemFn, ItemFn, ItemMacro, Lit, RevealHide, Stmt,
-    UnOp,
+    UnOp, Visibility,
 };
 use walkdir::WalkDir;
 
@@ -249,6 +249,30 @@ impl ExecVisitor<'_> {
             self.add(expr.span(), "condition-to-false", "false".into());
         }
     }
+
+    fn widen_external_body_visibility(
+        &mut self,
+        attributes: &[verus_syn::Attribute],
+        visibility: &Visibility,
+        fn_span: Span,
+    ) {
+        if !self.operators.external_body_visibility_widening || !has_external_body(attributes) {
+            return;
+        }
+        match visibility {
+            Visibility::Public(_) => {}
+            Visibility::Restricted(_) => {
+                self.add(
+                    visibility.span(),
+                    "widen-external-body-visibility",
+                    "pub".into(),
+                );
+            }
+            Visibility::Inherited => {
+                self.add(fn_span, "widen-external-body-visibility", "pub fn".into());
+            }
+        }
+    }
 }
 
 impl<'ast> Visit<'ast> for ExecVisitor<'_> {
@@ -260,6 +284,7 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
             return;
         }
         let previous = self.function.replace(node.sig.ident.to_string());
+        self.widen_external_body_visibility(&node.attrs, &node.vis, node.sig.fn_token.span());
         if self.operators.external_body_insertion && !has_external_body(&node.attrs) {
             self.add(
                 node.sig.fn_token.span(),
@@ -282,6 +307,7 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
             return;
         }
         let previous = self.function.replace(node.sig.ident.to_string());
+        self.widen_external_body_visibility(&node.attrs, &node.vis, node.sig.fn_token.span());
         if self.operators.external_body_insertion && !has_external_body(&node.attrs) {
             self.add(
                 node.sig.fn_token.span(),
@@ -524,6 +550,8 @@ use vstd::prelude::*;
 verus! {
 spec fn model(x: int) -> bool { x < 10 }
 proof fn lemma(x: int) { assert(x < 20); }
+#[verifier::external_body]
+pub(crate) fn foreign(x: i32) -> i32 { x }
 fn ignored(x: i32) -> bool { x < 100 }
 fn check(x: i32) -> bool
     requires x < 30,
@@ -575,6 +603,7 @@ fn check(x: i32) -> bool
         let assurance = OperatorsConfig {
             mutate_contracts: true,
             mutate_spec_functions: true,
+            external_body_visibility_widening: true,
             ..OperatorsConfig::default()
         };
         let mut assurance_mutants = Vec::new();
@@ -591,6 +620,12 @@ fn check(x: i32) -> bool
         assert!(assurance_mutants
             .iter()
             .any(|mutant| mutant.function.as_deref() == Some("model")));
+        assert!(assurance_mutants.iter().any(|mutant| {
+            mutant.function.as_deref() == Some("foreign")
+                && mutant.operator == "widen-external-body-visibility"
+                && mutant.original == "pub(crate)"
+                && mutant.replacement == "pub"
+        }));
         assert!(
             assurance_mutants
                 .iter()

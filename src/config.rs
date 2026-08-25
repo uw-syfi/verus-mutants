@@ -79,6 +79,7 @@ pub struct OperatorsConfig {
     pub struct_field_value_substitution: bool,
     pub match_arm_body_substitution: bool,
     pub external_body_insertion: bool,
+    pub external_body_visibility_widening: bool,
 }
 
 impl Default for OperatorsConfig {
@@ -97,6 +98,7 @@ impl Default for OperatorsConfig {
             struct_field_value_substitution: true,
             match_arm_body_substitution: true,
             external_body_insertion: false,
+            external_body_visibility_widening: false,
         }
     }
 }
