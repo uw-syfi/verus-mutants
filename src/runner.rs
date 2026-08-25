@@ -251,7 +251,11 @@ fn baseline_commands(
     verification: &config::VerificationConfig,
 ) -> Result<BTreeMap<String, Baseline>> {
     let mut commands = unique_commands(mutants, verification)?;
-    if verification.baseline_command.is_empty() {
+    if verification.baseline_command.is_empty()
+        || !mutants
+            .iter()
+            .any(|mutant| mutant.oracle.kind == crate::model::OracleKind::Verus)
+    {
         return Ok(commands);
     }
     commands.retain(|_, baseline| baseline.kind != crate::model::OracleKind::Verus);
