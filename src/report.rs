@@ -56,6 +56,16 @@ pub fn publish(root: &Path, summary: &RunSummary, json_stdout: bool) -> Result<(
             "  {} infrastructure failures",
             count(Outcome::InfrastructureFailure)
         );
+        let killed = count(Outcome::KilledByProof)
+            + count(Outcome::KilledByTest)
+            + count(Outcome::KilledByPolicy);
+        let survived = count(Outcome::Survived);
+        if killed + survived > 0 {
+            println!(
+                "  {:.1}% kill rate (invalid mutants excluded)",
+                100.0 * killed as f64 / (killed + survived) as f64
+            );
+        }
         println!("summary: {}", final_path.display());
     }
     Ok(())

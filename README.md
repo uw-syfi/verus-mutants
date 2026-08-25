@@ -161,6 +161,10 @@ Use repeated `--operator` arguments to focus an operator class, or
 `--limit-per-operator N` for a deterministic sample from every package/operator
 pair. Repeat `--exhaustive-operator NAME` to keep every mutant for a small,
 security-critical operator while sampling the rest of the campaign.
+By default any survivor fails the command. `--minimum-kill-rate RATE` enables
+the conventional mutation-score mode for broad automatic campaigns, where
+equivalent mutants are expected. Invalid mutants are excluded from the rate;
+timeouts and infrastructure failures always fail.
 
 Results have distinct meanings:
 

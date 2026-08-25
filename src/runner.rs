@@ -33,6 +33,7 @@ pub struct RunOptions<'a> {
     pub selected_operators: &'a [String],
     pub limit_per_operator: Option<usize>,
     pub exhaustive_operators: &'a [String],
+    pub minimum_kill_rate: Option<f64>,
 }
 
 pub fn run(options: RunOptions<'_>) -> Result<()> {
@@ -47,7 +48,14 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
         selected_operators,
         limit_per_operator,
         exhaustive_operators,
+        minimum_kill_rate,
     } = options;
+    if let Some(rate) = minimum_kill_rate {
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&rate),
+            "--minimum-kill-rate must be between 0 and 1"
+        );
+    }
     let loaded = config::load(manifest)?;
     let root = &loaded.root;
     let mut mutants = discover_all(&loaded, manual_only, automatic_only)?;
@@ -167,9 +175,37 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
     if summary
         .results
         .iter()
-        .any(|result| matches!(result.outcome, Outcome::Survived | Outcome::Timeout))
+        .any(|result| result.outcome == Outcome::Timeout)
     {
-        anyhow::bail!("one or more mutants survived or timed out");
+        anyhow::bail!("one or more mutants timed out");
+    }
+    let killed = summary
+        .results
+        .iter()
+        .filter(|result| {
+            matches!(
+                result.outcome,
+                Outcome::KilledByProof | Outcome::KilledByTest | Outcome::KilledByPolicy
+            )
+        })
+        .count();
+    let survived = summary
+        .results
+        .iter()
+        .filter(|result| result.outcome == Outcome::Survived)
+        .count();
+    if let Some(required) = minimum_kill_rate {
+        let observed = if killed + survived == 0 {
+            1.0
+        } else {
+            killed as f64 / (killed + survived) as f64
+        };
+        anyhow::ensure!(
+            observed >= required,
+            "mutation kill rate {observed:.3} is below required {required:.3}"
+        );
+    } else if survived > 0 {
+        anyhow::bail!("one or more mutants survived");
     }
     Ok(())
 }

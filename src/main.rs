@@ -67,6 +67,9 @@ struct RunArgs {
     /// Do not apply --limit-per-operator to this operator. May be repeated.
     #[arg(long = "exhaustive-operator")]
     exhaustive_operators: Vec<String>,
+    /// Accept survivors when the killed/(killed+survived) ratio meets this value.
+    #[arg(long)]
+    minimum_kill_rate: Option<f64>,
 }
 
 fn main() -> Result<()> {
@@ -90,6 +93,7 @@ fn main() -> Result<()> {
             operators: Vec::new(),
             limit_per_operator: None,
             exhaustive_operators: Vec::new(),
+            minimum_kill_rate: None,
         })
     }) {
         Command::List(args) => runner::list(&args.manifest_path, args.json),
@@ -104,6 +108,7 @@ fn main() -> Result<()> {
             selected_operators: &args.operators,
             limit_per_operator: args.limit_per_operator,
             exhaustive_operators: &args.exhaustive_operators,
+            minimum_kill_rate: args.minimum_kill_rate,
         }),
     }
 }
