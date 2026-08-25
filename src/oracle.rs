@@ -150,7 +150,12 @@ fn classify(
     }
     match mutant.oracle.kind {
         OracleKind::Verus => {
-            if let Some(kind) = proof_failure(output) {
+            // A verification command may compose Verus with executable
+            // positive witnesses. Their failure is a semantic kill, not an
+            // infrastructure error.
+            if output.contains("test result: FAILED") {
+                (Outcome::KilledByTest, first_error(output))
+            } else if let Some(kind) = proof_failure(output) {
                 (Outcome::KilledByProof, Some(kind.into()))
             } else if looks_invalid(output) {
                 (Outcome::Invalid, first_error(output))
@@ -296,6 +301,13 @@ mod tests {
             "error: postcondition not satisfied",
         );
         assert_eq!(proof.0, Outcome::KilledByProof);
+        let test = classify(
+            &mutant(OracleKind::Verus),
+            Some(101),
+            false,
+            "test result: FAILED. 1 passed; 1 failed",
+        );
+        assert_eq!(test.0, Outcome::KilledByTest);
         let compile = classify(
             &mutant(OracleKind::Verus),
             Some(101),
