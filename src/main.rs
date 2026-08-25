@@ -73,6 +73,12 @@ struct RunArgs {
     /// Require every selected mutant for this operator to be killed. May be repeated.
     #[arg(long = "require-zero-survivors-for")]
     zero_survivor_operators: Vec<String>,
+    /// Mutate only files changed since the merge base with this Git revision.
+    #[arg(long)]
+    in_diff: Option<String>,
+    /// Number of isolated mutation workers.
+    #[arg(long, default_value_t = 1)]
+    jobs: usize,
 }
 
 fn main() -> Result<()> {
@@ -98,6 +104,8 @@ fn main() -> Result<()> {
             exhaustive_operators: Vec::new(),
             minimum_kill_rate: None,
             zero_survivor_operators: Vec::new(),
+            in_diff: None,
+            jobs: 1,
         })
     }) {
         Command::List(args) => runner::list(&args.manifest_path, args.json),
@@ -114,6 +122,8 @@ fn main() -> Result<()> {
             exhaustive_operators: &args.exhaustive_operators,
             minimum_kill_rate: args.minimum_kill_rate,
             zero_survivor_operators: &args.zero_survivor_operators,
+            in_diff: args.in_diff.as_deref(),
+            jobs: args.jobs,
         }),
     }
 }

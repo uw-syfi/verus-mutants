@@ -167,6 +167,13 @@ equivalent mutants are expected. Invalid mutants are excluded from the rate;
 timeouts and infrastructure failures always fail.
 Repeat `--require-zero-survivors-for OPERATOR` to keep a critical operator at
 100% even when the overall campaign uses a mutation-score threshold.
+`--in-diff REF` limits discovery to files changed since `merge-base REF HEAD`,
+including uncommitted and untracked files. Operators named by
+`--exhaustive-operator` remain repository-wide, which keeps small trust-boundary
+campaigns exhaustive while ordinary PR mutations stay diff-scoped.
+`--jobs N` runs N isolated workers. Each worker owns its source and Cargo target
+directories, so concurrent mutations cannot share edited source or stale build
+artifacts. Baselines are repeated per worker to preserve that isolation.
 
 Results have distinct meanings:
 

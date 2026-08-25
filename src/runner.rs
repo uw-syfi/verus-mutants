@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -35,6 +36,8 @@ pub struct RunOptions<'a> {
     pub exhaustive_operators: &'a [String],
     pub minimum_kill_rate: Option<f64>,
     pub zero_survivor_operators: &'a [String],
+    pub in_diff: Option<&'a str>,
+    pub jobs: usize,
 }
 
 pub fn run(options: RunOptions<'_>) -> Result<()> {
@@ -51,7 +54,14 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
         exhaustive_operators,
         minimum_kill_rate,
         zero_survivor_operators,
+        in_diff,
+        jobs,
     } = options;
+    anyhow::ensure!(jobs > 0, "--jobs must be greater than zero");
+    anyhow::ensure!(
+        jobs == 1 || !fail_fast,
+        "--fail-fast is supported only with --jobs 1"
+    );
     if let Some(rate) = minimum_kill_rate {
         anyhow::ensure!(
             (0.0..=1.0).contains(&rate),
@@ -81,6 +91,13 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
             "selected automatic operators were not found: {missing:?}"
         );
     }
+    if let Some(reference) = in_diff {
+        let changed = changed_files_since(root, reference)?;
+        let exhaustive: BTreeSet<_> = exhaustive_operators.iter().collect();
+        mutants.retain(|mutant| {
+            exhaustive.contains(&mutant.operator) || changed.contains(&mutant.file)
+        });
+    }
     if let Some(per_operator) = limit_per_operator {
         let exhaustive: BTreeSet<_> = exhaustive_operators.iter().collect();
         let mut retained = BTreeMap::new();
@@ -104,63 +121,43 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
     }
     anyhow::ensure!(!mutants.is_empty(), "no mutants discovered");
     let digest = source_digest(root)?;
-    let output_root = root.join("target/verus-mutants");
-    let log_root = output_root.join("logs");
+    let log_root = root.join("target/verus-mutants/logs");
     fs::create_dir_all(&log_root)?;
-    let sandbox = TempDir::new().context("creating campaign sandbox")?;
-    let source = sandbox.path().join("source");
-    let target = sandbox.path().join("target");
-    materialize::copy_project(root, &source)?;
-
-    let commands = baseline_commands(&mutants, &loaded.config.verification)?;
-    for (key, baseline) in &commands {
-        let command = &baseline.command;
-        eprintln!("baseline: {}", command.join(" "));
-        let output = oracle::baseline(
-            &source,
-            &target,
-            command,
-            loaded.config.verification.timeout_seconds,
-            &baseline.kind,
-            baseline.required_test_count,
-        )?;
-        fs::write(log_root.join(format!("baseline-{key}.log")), output)?;
+    let worker_count = jobs.min(mutants.len());
+    let mut assignments = vec![Vec::new(); worker_count];
+    for (index, mutant) in mutants.into_iter().enumerate() {
+        assignments[index % worker_count].push(mutant);
     }
-
-    let mut results = Vec::new();
-    for mutant in mutants {
-        eprintln!("mutant {}: {}", mutant.id, mutant.operator);
-        let mutated_path = source.join(&mutant.file);
-        let original_source = fs::read(&mutated_path)
-            .with_context(|| format!("reading {} before mutation", mutated_path.display()))?;
-        materialize::apply(&source, &mutant)?;
-        let execution = oracle::execute(&source, &target, &mutant, &loaded.config.verification);
-        fs::write(&mutated_path, original_source)
-            .with_context(|| format!("restoring {} after mutation", mutated_path.display()))?;
-        let execution = execution?;
-        let log = PathBuf::from(format!("target/verus-mutants/logs/{}.log", mutant.id));
-        fs::write(root.join(&log), &execution.output)?;
-        eprintln!(
-            "  {:?} ({:.2}s)",
-            execution.outcome, execution.elapsed_seconds
-        );
-        let stop = matches!(
-            execution.outcome,
-            Outcome::Survived | Outcome::Timeout | Outcome::InfrastructureFailure
-        );
-        results.push(MutantResult {
-            mutant,
-            outcome: execution.outcome,
-            command: execution.command,
-            returncode: execution.returncode,
-            elapsed_seconds: execution.elapsed_seconds,
-            diagnostic: execution.diagnostic,
-            log,
-        });
-        if fail_fast && stop {
-            break;
-        }
-    }
+    let mut results =
+        if worker_count == 1 {
+            execute_worker(
+                0,
+                root,
+                assignments.pop().expect("one worker assignment"),
+                &loaded.config.verification,
+                fail_fast,
+            )?
+        } else {
+            std::thread::scope(|scope| -> Result<Vec<MutantResult>> {
+                let mut handles = Vec::new();
+                for (worker, assignment) in assignments.into_iter().enumerate() {
+                    let verification = &loaded.config.verification;
+                    handles.push(scope.spawn(move || {
+                        execute_worker(worker, root, assignment, verification, false)
+                    }));
+                }
+                let mut combined = Vec::new();
+                for handle in handles {
+                    combined.extend(
+                        handle
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("mutation worker panicked"))??,
+                    );
+                }
+                Ok(combined)
+            })?
+        };
+    results.sort_by(|left, right| left.mutant.id.cmp(&right.mutant.id));
     let summary = RunSummary {
         schema_version: 1,
         source_digest: digest,
@@ -233,6 +230,110 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
         anyhow::bail!("one or more mutants survived");
     }
     Ok(())
+}
+
+fn execute_worker(
+    worker: usize,
+    root: &Path,
+    mutants: Vec<Mutant>,
+    verification: &config::VerificationConfig,
+    fail_fast: bool,
+) -> Result<Vec<MutantResult>> {
+    let sandbox = TempDir::new().context("creating campaign worker sandbox")?;
+    let source = sandbox.path().join("source");
+    let target = sandbox.path().join("target");
+    materialize::copy_project(root, &source)?;
+    let log_root = root.join("target/verus-mutants/logs");
+    let commands = baseline_commands(&mutants, verification)?;
+    for (key, baseline) in &commands {
+        let command = &baseline.command;
+        eprintln!("worker {worker} baseline: {}", command.join(" "));
+        let output = oracle::baseline(
+            &source,
+            &target,
+            command,
+            verification.timeout_seconds,
+            &baseline.kind,
+            baseline.required_test_count,
+        )?;
+        fs::write(
+            log_root.join(format!("baseline-worker-{worker}-{key}.log")),
+            output,
+        )?;
+    }
+
+    let mut results = Vec::new();
+    for mutant in mutants {
+        eprintln!("worker {worker} mutant {}: {}", mutant.id, mutant.operator);
+        let mutated_path = source.join(&mutant.file);
+        let original_source = fs::read(&mutated_path)
+            .with_context(|| format!("reading {} before mutation", mutated_path.display()))?;
+        materialize::apply(&source, &mutant)?;
+        let execution = oracle::execute(&source, &target, &mutant, verification);
+        fs::write(&mutated_path, original_source)
+            .with_context(|| format!("restoring {} after mutation", mutated_path.display()))?;
+        let execution = execution?;
+        let log = PathBuf::from(format!("target/verus-mutants/logs/{}.log", mutant.id));
+        fs::write(root.join(&log), &execution.output)?;
+        eprintln!(
+            "worker {worker}   {:?} ({:.2}s)",
+            execution.outcome, execution.elapsed_seconds
+        );
+        let stop = matches!(
+            execution.outcome,
+            Outcome::Survived | Outcome::Timeout | Outcome::InfrastructureFailure
+        );
+        results.push(MutantResult {
+            mutant,
+            outcome: execution.outcome,
+            command: execution.command,
+            returncode: execution.returncode,
+            elapsed_seconds: execution.elapsed_seconds,
+            diagnostic: execution.diagnostic,
+            log,
+        });
+        if fail_fast && stop {
+            break;
+        }
+    }
+    Ok(results)
+}
+
+fn changed_files_since(root: &Path, reference: &str) -> Result<BTreeSet<PathBuf>> {
+    let output = |arguments: &[&str]| -> Result<String> {
+        let result = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(arguments)
+            .output()
+            .context("running git for diff-scoped mutation discovery")?;
+        anyhow::ensure!(
+            result.status.success(),
+            "git {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&result.stderr).trim()
+        );
+        Ok(String::from_utf8(result.stdout)?.trim().to_owned())
+    };
+    let top = PathBuf::from(output(&["rev-parse", "--show-toplevel"])?);
+    let root = root.canonicalize()?;
+    let base = output(&["merge-base", reference, "HEAD"])?;
+    let tracked = output(&["diff", "--name-only", "--diff-filter=ACMR", &base, "--"])?;
+    let untracked = output(&[
+        "ls-files",
+        "--full-name",
+        "--others",
+        "--exclude-standard",
+        "--",
+    ])?;
+    let mut changed = BTreeSet::new();
+    for relative in tracked.lines().chain(untracked.lines()) {
+        let path = top.join(relative);
+        if let Ok(workspace_relative) = path.strip_prefix(&root) {
+            changed.insert(workspace_relative.to_path_buf());
+        }
+    }
+    Ok(changed)
 }
 
 fn discover_all(
