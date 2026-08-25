@@ -16,6 +16,7 @@ pub struct Config {
     pub verification: VerificationConfig,
     pub operators: OperatorsConfig,
     pub operator_oracles: BTreeMap<String, ManualOracleConfig>,
+    pub rust_mutants: RustMutantsConfig,
     #[serde(rename = "manual_mutant")]
     pub manual_mutants: Vec<ManualMutantConfig>,
 }
@@ -126,6 +127,8 @@ pub struct ManualOracleConfig {
     #[serde(default)]
     pub expected_pattern: Option<String>,
     #[serde(default)]
+    pub invalid_pattern: Option<String>,
+    #[serde(default)]
     pub required_test_count: Option<usize>,
 }
 
@@ -139,9 +142,18 @@ impl ManualOracleConfig {
                 .or_else(|| Some(default_package.to_owned())),
             command: self.command.clone(),
             expected_pattern: self.expected_pattern.clone(),
+            invalid_pattern: self.invalid_pattern.clone(),
             required_test_count: self.required_test_count,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct RustMutantsConfig {
+    pub enabled: bool,
+    pub inventory_command: Vec<String>,
+    pub oracle: Option<ManualOracleConfig>,
 }
 
 fn one() -> usize {
@@ -215,6 +227,7 @@ impl ManualMutantConfig {
             package: None,
             command: Vec::new(),
             expected_pattern: None,
+            invalid_pattern: None,
             required_test_count: None,
         });
         Ok(Mutant {
@@ -234,6 +247,7 @@ impl ManualMutantConfig {
                 package: oracle.package,
                 command: oracle.command,
                 expected_pattern: oracle.expected_pattern,
+                invalid_pattern: oracle.invalid_pattern,
                 required_test_count: oracle.required_test_count,
             },
         })

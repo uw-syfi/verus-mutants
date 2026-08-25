@@ -100,6 +100,18 @@ kind = "command"
 command = ["python3", "ci/check_verified_architecture.py"]
 expected_pattern = "verified architecture policy was violated"
 
+# Reuse cargo-mutants for ordinary Rust syntax while retaining this runner's
+# custom oracle and outcome classification.
+[rust_mutants]
+enabled = true
+inventory_command = ["cargo", "mutants", "--list", "--json", "--workspace"]
+
+[rust_mutants.oracle]
+kind = "command"
+command = ["python3", "ci/check_rust_mutant.py", "{package}"]
+expected_pattern = "AUTOMATIC_MUTANT_REJECTED"
+invalid_pattern = "AUTOMATIC_MUTANT_INVALID"
+
 [[manual_mutant]]
 id = "M-DOMAIN-FAULT"
 file = "crates/verified-crate/src/lib.rs"
@@ -129,6 +141,13 @@ not ordinary implementation-test gaps.
 Projects normally route that operator to an architecture-policy command through
 `operator_oracles`, as shown above. The repository-specific input is the trust
 policy and its oracle, not a textual mutant.
+
+`rust_mutants` accepts the JSON inventory emitted by cargo-mutants and converts
+it into the same isolated mutation and oracle protocol. This lets projects use
+cargo-mutants' mature ordinary-Rust discovery without forcing `cargo test` to
+be the only oracle. The inventory command, production feature matrix, and
+architecture oracle remain project inputs because a generic mutation engine
+cannot infer those policies.
 
 Use repeated `--operator` arguments to focus an operator class, or
 `--limit-per-operator N` for a deterministic sample from every package/operator

@@ -6,6 +6,7 @@ mod model;
 mod oracle;
 mod report;
 mod runner;
+mod rust;
 
 use std::path::PathBuf;
 

@@ -14,6 +14,7 @@ use crate::materialize;
 use crate::model::{Mutant, MutantResult, Outcome, RunSummary};
 use crate::oracle;
 use crate::report;
+use crate::rust;
 
 pub fn list(manifest: &Path, json: bool) -> Result<()> {
     let loaded = config::load(manifest)?;
@@ -198,6 +199,10 @@ fn discover_all(
             &loaded.root,
             &verified,
             &loaded.config,
+        )?);
+        mutants.extend(rust::automatic_mutants(
+            &loaded.root,
+            &loaded.config.rust_mutants,
         )?);
     }
     if !automatic_only {
