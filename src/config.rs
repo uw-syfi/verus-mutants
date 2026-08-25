@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,7 @@ pub struct Config {
     pub project: ProjectConfig,
     pub verification: VerificationConfig,
     pub operators: OperatorsConfig,
+    pub operator_oracles: BTreeMap<String, ManualOracleConfig>,
     #[serde(rename = "manual_mutant")]
     pub manual_mutants: Vec<ManualMutantConfig>,
 }
@@ -61,19 +63,37 @@ impl Default for VerificationConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct OperatorsConfig {
+    pub mutate_contracts: bool,
+    pub mutate_spec_functions: bool,
     pub condition_to_true: bool,
     pub condition_to_false: bool,
     pub logical_clause_deletion: bool,
     pub relational_replacement: bool,
+    pub boolean_literal_replacement: bool,
+    pub integer_literal_replacement: bool,
+    pub arithmetic_replacement: bool,
+    pub statement_deletion: bool,
+    pub struct_field_value_substitution: bool,
+    pub match_arm_body_substitution: bool,
+    pub external_body_insertion: bool,
 }
 
 impl Default for OperatorsConfig {
     fn default() -> Self {
         Self {
+            mutate_contracts: false,
+            mutate_spec_functions: false,
             condition_to_true: true,
             condition_to_false: true,
             logical_clause_deletion: true,
             relational_replacement: true,
+            boolean_literal_replacement: true,
+            integer_literal_replacement: true,
+            arithmetic_replacement: true,
+            statement_deletion: true,
+            struct_field_value_substitution: true,
+            match_arm_body_substitution: true,
+            external_body_insertion: false,
         }
     }
 }
@@ -105,6 +125,21 @@ pub struct ManualOracleConfig {
     pub expected_pattern: Option<String>,
     #[serde(default)]
     pub required_test_count: Option<usize>,
+}
+
+impl ManualOracleConfig {
+    pub fn to_spec(&self, default_package: &str) -> OracleSpec {
+        OracleSpec {
+            kind: self.kind.clone(),
+            package: self
+                .package
+                .clone()
+                .or_else(|| Some(default_package.to_owned())),
+            command: self.command.clone(),
+            expected_pattern: self.expected_pattern.clone(),
+            required_test_count: self.required_test_count,
+        }
+    }
 }
 
 fn one() -> usize {

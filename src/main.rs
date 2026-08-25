@@ -57,6 +57,12 @@ struct RunArgs {
     /// Run only this mutant ID. May be repeated.
     #[arg(long = "mutant")]
     mutants: Vec<String>,
+    /// Run only this automatic operator. May be repeated.
+    #[arg(long = "operator")]
+    operators: Vec<String>,
+    /// Retain at most this many mutants per package/operator pair.
+    #[arg(long)]
+    limit_per_operator: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -77,17 +83,21 @@ fn main() -> Result<()> {
             fail_fast: false,
             limit: None,
             mutants: Vec::new(),
+            operators: Vec::new(),
+            limit_per_operator: None,
         })
     }) {
         Command::List(args) => runner::list(&args.manifest_path, args.json),
-        Command::Run(args) => runner::run(
-            &args.common.manifest_path,
-            args.common.json,
-            args.manual_only,
-            args.automatic_only,
-            args.fail_fast,
-            args.limit,
-            &args.mutants,
-        ),
+        Command::Run(args) => runner::run(runner::RunOptions {
+            manifest: &args.common.manifest_path,
+            json: args.common.json,
+            manual_only: args.manual_only,
+            automatic_only: args.automatic_only,
+            fail_fast: args.fail_fast,
+            limit: args.limit,
+            selected_ids: &args.mutants,
+            selected_operators: &args.operators,
+            limit_per_operator: args.limit_per_operator,
+        }),
     }
 }

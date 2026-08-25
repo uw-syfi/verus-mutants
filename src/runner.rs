@@ -21,15 +21,30 @@ pub fn list(manifest: &Path, json: bool) -> Result<()> {
     report::print_list(&mutants, json)
 }
 
-pub fn run(
-    manifest: &Path,
-    json: bool,
-    manual_only: bool,
-    automatic_only: bool,
-    fail_fast: bool,
-    limit: Option<usize>,
-    selected_ids: &[String],
-) -> Result<()> {
+pub struct RunOptions<'a> {
+    pub manifest: &'a Path,
+    pub json: bool,
+    pub manual_only: bool,
+    pub automatic_only: bool,
+    pub fail_fast: bool,
+    pub limit: Option<usize>,
+    pub selected_ids: &'a [String],
+    pub selected_operators: &'a [String],
+    pub limit_per_operator: Option<usize>,
+}
+
+pub fn run(options: RunOptions<'_>) -> Result<()> {
+    let RunOptions {
+        manifest,
+        json,
+        manual_only,
+        automatic_only,
+        fail_fast,
+        limit,
+        selected_ids,
+        selected_operators,
+        limit_per_operator,
+    } = options;
     let loaded = config::load(manifest)?;
     let root = &loaded.root;
     let mut mutants = discover_all(&loaded, manual_only, automatic_only)?;
@@ -42,6 +57,30 @@ pub fn run(
             missing.is_empty(),
             "selected mutant IDs were not found: {missing:?}"
         );
+    }
+    if !selected_operators.is_empty() {
+        let selected: BTreeSet<_> = selected_operators.iter().collect();
+        mutants.retain(|mutant| selected.contains(&mutant.operator));
+        let found: BTreeSet<_> = mutants.iter().map(|mutant| &mutant.operator).collect();
+        let missing: Vec<_> = selected.difference(&found).collect();
+        anyhow::ensure!(
+            missing.is_empty(),
+            "selected automatic operators were not found: {missing:?}"
+        );
+    }
+    if let Some(per_operator) = limit_per_operator {
+        let mut retained = BTreeMap::new();
+        mutants.retain(|mutant| {
+            let count = retained
+                .entry((mutant.package.clone(), mutant.operator.clone()))
+                .or_insert(0usize);
+            if *count >= per_operator {
+                false
+            } else {
+                *count += 1;
+                true
+            }
+        });
     }
     if let Some(limit) = limit {
         mutants.truncate(limit);

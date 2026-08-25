@@ -75,10 +75,28 @@ command = ["cargo", "verus", "build", "-p", "{package}"]
 timeout_seconds = 240
 
 [operators]
+# Optional assurance-hardening campaigns. Disabled by default because these
+# mutate the oracle itself rather than only executable implementation code.
+mutate_contracts = false
+mutate_spec_functions = false
 condition_to_true = true
 condition_to_false = true
 logical_clause_deletion = true
 relational_replacement = true
+boolean_literal_replacement = true
+integer_literal_replacement = true
+arithmetic_replacement = true
+statement_deletion = true
+struct_field_value_substitution = true
+match_arm_body_substitution = true
+external_body_insertion = false
+
+# Route trust-boundary challenges to a structural policy oracle instead of
+# treating a successful Verus run as survival.
+[operator_oracles.insert-external-body]
+kind = "command"
+command = ["python3", "ci/check_verified_architecture.py"]
+expected_pattern = "verified architecture policy was violated"
 
 [[manual_mutant]]
 id = "M-DOMAIN-FAULT"
@@ -93,11 +111,26 @@ Verus. A nonstandard test or command oracle can set `kind`, `command`,
 
 ## Mutation and oracle semantics
 
-The automatic campaign parses `verus!` bodies with `verus_syn`. It visits only
-default or `exec` function bodies. It does not mutate contracts, spec/proof
-functions, assertions, assumptions, quantifiers, proof closures, or loop proof
-clauses. The current operators replace conditions with constants, delete a
-logical clause, and replace relational operators.
+The automatic campaign parses `verus!` bodies with `verus_syn`. By default it
+visits only default or `exec` function bodies. It does not mutate assertions,
+assumptions, quantifiers, proof closures, or loop proof clauses. Operators cover
+conditions, logical clauses, relational and arithmetic operators, literals,
+standalone effect statements, struct field values, and match-arm bodies.
+
+`mutate_contracts` and `mutate_spec_functions` enable a separate assurance
+hardening campaign. These mutations challenge whether the rest of the proof
+actually depends on a precondition, invariant, or model relation. They mutate
+the oracle itself, so projects should review survivors as specification gaps,
+not ordinary implementation-test gaps.
+
+`external_body_insertion` challenges the trusted boundary automatically.
+Projects normally route that operator to an architecture-policy command through
+`operator_oracles`, as shown above. The repository-specific input is the trust
+policy and its oracle, not a textual mutant.
+
+Use repeated `--operator` arguments to focus an operator class, or
+`--limit-per-operator N` for a deterministic sample from every package/operator
+pair.
 
 Results have distinct meanings:
 
