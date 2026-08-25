@@ -146,6 +146,9 @@ policy and its oracle, not a textual mutant.
 `external_body_visibility_widening` makes each non-public `external_body`
 function public. Route it to the same architecture-policy oracle to check that
 foreign-effect settlement functions cannot be exported accidentally.
+Bodies of existing `external_body` functions are not mutated because Verus
+deliberately does not verify them. Their contracts are still mutated when
+`mutate_contracts` is enabled.
 
 `rust_mutants` accepts the JSON inventory emitted by cargo-mutants and converts
 it into the same isolated mutation and oracle protocol. This lets projects use

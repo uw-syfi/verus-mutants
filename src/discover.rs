@@ -285,7 +285,8 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
         }
         let previous = self.function.replace(node.sig.ident.to_string());
         self.widen_external_body_visibility(&node.attrs, &node.vis, node.sig.fn_token.span());
-        if self.operators.external_body_insertion && !has_external_body(&node.attrs) {
+        let external = has_external_body(&node.attrs);
+        if self.operators.external_body_insertion && !external {
             self.add(
                 node.sig.fn_token.span(),
                 "insert-external-body",
@@ -295,7 +296,9 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
         if self.operators.mutate_contracts {
             visit::visit_signature(self, &node.sig);
         }
-        visit::visit_block(self, &node.block);
+        if !external {
+            visit::visit_block(self, &node.block);
+        }
         self.function = previous;
     }
 
@@ -308,7 +311,8 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
         }
         let previous = self.function.replace(node.sig.ident.to_string());
         self.widen_external_body_visibility(&node.attrs, &node.vis, node.sig.fn_token.span());
-        if self.operators.external_body_insertion && !has_external_body(&node.attrs) {
+        let external = has_external_body(&node.attrs);
+        if self.operators.external_body_insertion && !external {
             self.add(
                 node.sig.fn_token.span(),
                 "insert-external-body",
@@ -318,7 +322,9 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
         if self.operators.mutate_contracts {
             visit::visit_signature(self, &node.sig);
         }
-        visit::visit_block(self, &node.block);
+        if !external {
+            visit::visit_block(self, &node.block);
+        }
         self.function = previous;
     }
 
@@ -625,6 +631,10 @@ fn check(x: i32) -> bool
                 && mutant.operator == "widen-external-body-visibility"
                 && mutant.original == "pub(crate)"
                 && mutant.replacement == "pub"
+        }));
+        assert!(assurance_mutants.iter().all(|mutant| {
+            mutant.function.as_deref() != Some("foreign")
+                || mutant.operator == "widen-external-body-visibility"
         }));
         assert!(
             assurance_mutants
