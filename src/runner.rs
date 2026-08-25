@@ -34,6 +34,7 @@ pub struct RunOptions<'a> {
     pub limit_per_operator: Option<usize>,
     pub exhaustive_operators: &'a [String],
     pub minimum_kill_rate: Option<f64>,
+    pub zero_survivor_operators: &'a [String],
 }
 
 pub fn run(options: RunOptions<'_>) -> Result<()> {
@@ -49,6 +50,7 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
         limit_per_operator,
         exhaustive_operators,
         minimum_kill_rate,
+        zero_survivor_operators,
     } = options;
     if let Some(rate) = minimum_kill_rate {
         anyhow::ensure!(
@@ -194,6 +196,29 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
         .iter()
         .filter(|result| result.outcome == Outcome::Survived)
         .count();
+    let required: BTreeSet<_> = zero_survivor_operators.iter().collect();
+    let observed_operators: BTreeSet<_> = summary
+        .results
+        .iter()
+        .map(|result| &result.mutant.operator)
+        .collect();
+    let missing_required: Vec<_> = required.difference(&observed_operators).collect();
+    anyhow::ensure!(
+        missing_required.is_empty(),
+        "required zero-survivor operators were not selected: {missing_required:?}"
+    );
+    let critical_survivors: Vec<_> = summary
+        .results
+        .iter()
+        .filter(|result| {
+            result.outcome == Outcome::Survived && required.contains(&result.mutant.operator)
+        })
+        .map(|result| result.mutant.id.as_str())
+        .collect();
+    anyhow::ensure!(
+        critical_survivors.is_empty(),
+        "required operators have surviving mutants: {critical_survivors:?}"
+    );
     if let Some(required) = minimum_kill_rate {
         let observed = if killed + survived == 0 {
             1.0

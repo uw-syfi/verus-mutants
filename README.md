@@ -165,6 +165,8 @@ By default any survivor fails the command. `--minimum-kill-rate RATE` enables
 the conventional mutation-score mode for broad automatic campaigns, where
 equivalent mutants are expected. Invalid mutants are excluded from the rate;
 timeouts and infrastructure failures always fail.
+Repeat `--require-zero-survivors-for OPERATOR` to keep a critical operator at
+100% even when the overall campaign uses a mutation-score threshold.
 
 Results have distinct meanings:
 

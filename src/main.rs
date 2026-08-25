@@ -70,6 +70,9 @@ struct RunArgs {
     /// Accept survivors when the killed/(killed+survived) ratio meets this value.
     #[arg(long)]
     minimum_kill_rate: Option<f64>,
+    /// Require every selected mutant for this operator to be killed. May be repeated.
+    #[arg(long = "require-zero-survivors-for")]
+    zero_survivor_operators: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -94,6 +97,7 @@ fn main() -> Result<()> {
             limit_per_operator: None,
             exhaustive_operators: Vec::new(),
             minimum_kill_rate: None,
+            zero_survivor_operators: Vec::new(),
         })
     }) {
         Command::List(args) => runner::list(&args.manifest_path, args.json),
@@ -109,6 +113,7 @@ fn main() -> Result<()> {
             limit_per_operator: args.limit_per_operator,
             exhaustive_operators: &args.exhaustive_operators,
             minimum_kill_rate: args.minimum_kill_rate,
+            zero_survivor_operators: &args.zero_survivor_operators,
         }),
     }
 }
