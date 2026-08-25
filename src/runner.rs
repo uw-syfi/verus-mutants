@@ -32,6 +32,7 @@ pub struct RunOptions<'a> {
     pub selected_ids: &'a [String],
     pub selected_operators: &'a [String],
     pub limit_per_operator: Option<usize>,
+    pub exhaustive_operators: &'a [String],
 }
 
 pub fn run(options: RunOptions<'_>) -> Result<()> {
@@ -45,6 +46,7 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
         selected_ids,
         selected_operators,
         limit_per_operator,
+        exhaustive_operators,
     } = options;
     let loaded = config::load(manifest)?;
     let root = &loaded.root;
@@ -70,8 +72,12 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
         );
     }
     if let Some(per_operator) = limit_per_operator {
+        let exhaustive: BTreeSet<_> = exhaustive_operators.iter().collect();
         let mut retained = BTreeMap::new();
         mutants.retain(|mutant| {
+            if exhaustive.contains(&mutant.operator) {
+                return true;
+            }
             let count = retained
                 .entry((mutant.package.clone(), mutant.operator.clone()))
                 .or_insert(0usize);

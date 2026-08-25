@@ -156,7 +156,8 @@ cannot infer those policies.
 
 Use repeated `--operator` arguments to focus an operator class, or
 `--limit-per-operator N` for a deterministic sample from every package/operator
-pair.
+pair. Repeat `--exhaustive-operator NAME` to keep every mutant for a small,
+security-critical operator while sampling the rest of the campaign.
 
 Results have distinct meanings:
 

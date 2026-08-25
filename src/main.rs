@@ -64,6 +64,9 @@ struct RunArgs {
     /// Retain at most this many mutants per package/operator pair.
     #[arg(long)]
     limit_per_operator: Option<usize>,
+    /// Do not apply --limit-per-operator to this operator. May be repeated.
+    #[arg(long = "exhaustive-operator")]
+    exhaustive_operators: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -86,6 +89,7 @@ fn main() -> Result<()> {
             mutants: Vec::new(),
             operators: Vec::new(),
             limit_per_operator: None,
+            exhaustive_operators: Vec::new(),
         })
     }) {
         Command::List(args) => runner::list(&args.manifest_path, args.json),
@@ -99,6 +103,7 @@ fn main() -> Result<()> {
             selected_ids: &args.mutants,
             selected_operators: &args.operators,
             limit_per_operator: args.limit_per_operator,
+            exhaustive_operators: &args.exhaustive_operators,
         }),
     }
 }
