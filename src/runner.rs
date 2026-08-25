@@ -37,6 +37,7 @@ pub struct RunOptions<'a> {
     pub minimum_kill_rate: Option<f64>,
     pub zero_survivor_operators: &'a [String],
     pub in_diff: Option<&'a str>,
+    pub selected_files: &'a [PathBuf],
     pub jobs: usize,
 }
 
@@ -55,6 +56,7 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
         minimum_kill_rate,
         zero_survivor_operators,
         in_diff,
+        selected_files,
         jobs,
     } = options;
     anyhow::ensure!(jobs > 0, "--jobs must be greater than zero");
@@ -96,6 +98,13 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
         let exhaustive: BTreeSet<_> = exhaustive_operators.iter().collect();
         mutants.retain(|mutant| {
             exhaustive.contains(&mutant.operator) || changed.contains(&mutant.file)
+        });
+    }
+    if !selected_files.is_empty() {
+        let selected: BTreeSet<_> = selected_files.iter().collect();
+        let exhaustive: BTreeSet<_> = exhaustive_operators.iter().collect();
+        mutants.retain(|mutant| {
+            exhaustive.contains(&mutant.operator) || selected.contains(&mutant.file)
         });
     }
     if let Some(per_operator) = limit_per_operator {

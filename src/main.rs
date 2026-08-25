@@ -26,7 +26,7 @@ enum Command {
     /// Discover mutants without executing their oracles.
     List(CommonArgs),
     /// Execute mutants. This is the default command.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
 }
 
 #[derive(Debug, clap::Args)]
@@ -76,6 +76,9 @@ struct RunArgs {
     /// Mutate only files changed since the merge base with this Git revision.
     #[arg(long)]
     in_diff: Option<String>,
+    /// Mutate this workspace-relative file. May be repeated.
+    #[arg(long = "file")]
+    files: Vec<PathBuf>,
     /// Number of isolated mutation workers.
     #[arg(long, default_value_t = 1)]
     jobs: usize,
@@ -89,7 +92,7 @@ fn main() -> Result<()> {
     }
     let cli = Cli::parse_from(args);
     match cli.command.unwrap_or_else(|| {
-        Command::Run(RunArgs {
+        Command::Run(Box::new(RunArgs {
             common: CommonArgs {
                 manifest_path: PathBuf::from("."),
                 json: false,
@@ -105,8 +108,9 @@ fn main() -> Result<()> {
             minimum_kill_rate: None,
             zero_survivor_operators: Vec::new(),
             in_diff: None,
+            files: Vec::new(),
             jobs: 1,
-        })
+        }))
     }) {
         Command::List(args) => runner::list(&args.manifest_path, args.json),
         Command::Run(args) => runner::run(runner::RunOptions {
@@ -123,6 +127,7 @@ fn main() -> Result<()> {
             minimum_kill_rate: args.minimum_kill_rate,
             zero_survivor_operators: &args.zero_survivor_operators,
             in_diff: args.in_diff.as_deref(),
+            selected_files: &args.files,
             jobs: args.jobs,
         }),
     }

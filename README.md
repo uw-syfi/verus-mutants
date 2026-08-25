@@ -171,6 +171,9 @@ Repeat `--require-zero-survivors-for OPERATOR` to keep a critical operator at
 including uncommitted and untracked files. Operators named by
 `--exhaustive-operator` remain repository-wide, which keeps small trust-boundary
 campaigns exhaustive while ordinary PR mutations stay diff-scoped.
+Use repeated `--file PATH` arguments when a container or remote runner cannot
+read the repository's Git metadata. Paths are workspace-relative and have the
+same exhaustive-operator behavior as `--in-diff`.
 `--jobs N` runs N isolated workers. Each worker owns its source and Cargo target
 directories, so concurrent mutations cannot share edited source or stale build
 artifacts. Baselines are repeated per worker to preserve that isolation.
