@@ -95,7 +95,7 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
     let target = sandbox.path().join("target");
     materialize::copy_project(root, &source)?;
 
-    let commands = unique_commands(&mutants, &loaded.config.verification)?;
+    let commands = baseline_commands(&mutants, &loaded.config.verification)?;
     for (key, baseline) in &commands {
         let command = &baseline.command;
         eprintln!("baseline: {}", command.join(" "));
@@ -238,6 +238,32 @@ fn unique_commands(
             required_test_count: mutant.oracle.required_test_count,
         });
     }
+    Ok(commands)
+}
+
+fn baseline_commands(
+    mutants: &[Mutant],
+    verification: &config::VerificationConfig,
+) -> Result<BTreeMap<String, Baseline>> {
+    let mut commands = unique_commands(mutants, verification)?;
+    if verification.baseline_command.is_empty() {
+        return Ok(commands);
+    }
+    commands.retain(|_, baseline| baseline.kind != crate::model::OracleKind::Verus);
+    let encoded = serde_json::to_vec(&(
+        &verification.baseline_command,
+        &crate::model::OracleKind::Verus,
+        Option::<usize>::None,
+    ))?;
+    let key = hex::encode(Sha256::digest(encoded));
+    commands.insert(
+        key[..12].to_string(),
+        Baseline {
+            command: verification.baseline_command.clone(),
+            kind: crate::model::OracleKind::Verus,
+            required_test_count: None,
+        },
+    );
     Ok(commands)
 }
 

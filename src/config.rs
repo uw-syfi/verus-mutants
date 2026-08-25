@@ -42,6 +42,7 @@ impl Default for ProjectConfig {
 #[serde(default)]
 pub struct VerificationConfig {
     pub command: Vec<String>,
+    pub baseline_command: Vec<String>,
     pub timeout_seconds: u64,
 }
 
@@ -55,6 +56,7 @@ impl Default for VerificationConfig {
                 "-p".into(),
                 "{package}".into(),
             ],
+            baseline_command: Vec::new(),
             timeout_seconds: 240,
         }
     }

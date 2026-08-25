@@ -73,6 +73,7 @@ exclude_functions = ["ffi_*", "trusted_boundary"]
 
 [verification]
 command = ["cargo", "verus", "build", "-p", "{package}"]
+baseline_command = ["cargo", "verus", "build", "--workspace"]
 timeout_seconds = 240
 
 [operators]
