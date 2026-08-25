@@ -220,6 +220,7 @@ impl ExecVisitor<'_> {
                 package: Some(self.package.name.clone()),
                 command: Vec::new(),
                 expected_pattern: None,
+                invalid_pattern: None,
                 required_test_count: None,
             },
             |override_spec| override_spec.to_spec(&self.package.name),
