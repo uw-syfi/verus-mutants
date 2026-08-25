@@ -38,9 +38,10 @@ git clone https://github.com/uw-syfi/verus-mutants
 cargo install --path verus-mutants
 ```
 
-Each oracle first runs against a clean isolated copy. Every mutant then gets a
-fresh source tree and Cargo target directory. Logs and an atomic JSON summary
-are written to `target/verus-mutants/` in the analyzed project.
+Each oracle first runs against one clean isolated source tree. Mutants are
+applied and restored one at a time in that tree, reusing its Cargo target so
+incremental Verus builds remain effective. Logs and an atomic JSON summary are
+written to `target/verus-mutants/` in the analyzed project.
 The process exits unsuccessfully for survivors, timeouts, or infrastructure
 failures, after publishing the report. Invalid mutants remain visible but do
 not fail the campaign.
@@ -152,8 +153,8 @@ pass at least `required_test_count` tests, or one test by default.
 This is source-aware, not compiler-native. `verus_syn` can identify syntactic
 exec regions, but only Verus can resolve all expression modes and types. The
 runner therefore filters invalid mutants after generation. Campaigns are
-sequential and use fresh target directories for reliability, so use package
-filters, mutant IDs, and `--limit` for development runs.
+sequential and reuse one isolated incremental target. Use package filters,
+operator filters, mutant IDs, and deterministic limits for development runs.
 
 The next scalability step is a Verus-side mutation inventory containing stable
 IR node IDs, resolved modes and types, followed by process-level parallelism

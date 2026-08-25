@@ -90,15 +90,15 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
     let output_root = root.join("target/verus-mutants");
     let log_root = output_root.join("logs");
     fs::create_dir_all(&log_root)?;
+    let sandbox = TempDir::new().context("creating campaign sandbox")?;
+    let source = sandbox.path().join("source");
+    let target = sandbox.path().join("target");
+    materialize::copy_project(root, &source)?;
 
     let commands = unique_commands(&mutants, &loaded.config.verification)?;
     for (key, baseline) in &commands {
         let command = &baseline.command;
         eprintln!("baseline: {}", command.join(" "));
-        let sandbox = TempDir::new().context("creating baseline sandbox")?;
-        let source = sandbox.path().join("source");
-        let target = sandbox.path().join("target");
-        materialize::copy_project(root, &source)?;
         let output = oracle::baseline(
             &source,
             &target,
@@ -113,12 +113,14 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
     let mut results = Vec::new();
     for mutant in mutants {
         eprintln!("mutant {}: {}", mutant.id, mutant.operator);
-        let sandbox = TempDir::new().context("creating mutant sandbox")?;
-        let source = sandbox.path().join("source");
-        let target = sandbox.path().join("target");
-        materialize::copy_project(root, &source)?;
+        let mutated_path = source.join(&mutant.file);
+        let original_source = fs::read(&mutated_path)
+            .with_context(|| format!("reading {} before mutation", mutated_path.display()))?;
         materialize::apply(&source, &mutant)?;
-        let execution = oracle::execute(&source, &target, &mutant, &loaded.config.verification)?;
+        let execution = oracle::execute(&source, &target, &mutant, &loaded.config.verification);
+        fs::write(&mutated_path, original_source)
+            .with_context(|| format!("restoring {} after mutation", mutated_path.display()))?;
+        let execution = execution?;
         let log = PathBuf::from(format!("target/verus-mutants/logs/{}.log", mutant.id));
         fs::write(root.join(&log), &execution.output)?;
         eprintln!(
