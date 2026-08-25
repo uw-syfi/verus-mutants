@@ -7,15 +7,13 @@ use walkdir::WalkDir;
 use crate::model::Mutant;
 
 pub fn copy_project(source: &Path, destination: &Path) -> Result<()> {
-    for entry in WalkDir::new(source).follow_links(false) {
+    for entry in WalkDir::new(source)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !excluded(source, entry.path()))
+    {
         let entry = entry?;
         let relative = entry.path().strip_prefix(source)?;
-        if relative.components().any(|part| {
-            let part = part.as_os_str();
-            part == ".git" || part == "target" || part == ".verus-mutants"
-        }) {
-            continue;
-        }
         let target = destination.join(relative);
         if entry.file_type().is_dir() {
             fs::create_dir_all(&target)?;
@@ -30,6 +28,15 @@ pub fn copy_project(source: &Path, destination: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn excluded(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root).is_ok_and(|relative| {
+        relative.components().any(|part| {
+            let part = part.as_os_str();
+            part == ".git" || part == "target" || part == ".verus-mutants"
+        })
+    })
 }
 
 pub fn apply(root: &Path, mutant: &Mutant) -> Result<()> {

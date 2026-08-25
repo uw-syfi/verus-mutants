@@ -241,14 +241,14 @@ fn unique_commands(
 
 fn source_digest(root: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
-    for entry in WalkDir::new(root).follow_links(false) {
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !digest_excluded(root, entry.path()))
+    {
         let entry = entry?;
         let relative = entry.path().strip_prefix(root)?;
-        if relative.components().any(|part| {
-            let part = part.as_os_str();
-            part == ".git" || part == "target" || part == ".verus-mutants"
-        }) || !entry.file_type().is_file()
-        {
+        if !entry.file_type().is_file() {
             continue;
         }
         hasher.update(relative.to_string_lossy().as_bytes());
@@ -257,6 +257,15 @@ fn source_digest(root: &Path) -> Result<String> {
         hasher.update([0]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn digest_excluded(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root).is_ok_and(|relative| {
+        relative.components().any(|part| {
+            let part = part.as_os_str();
+            part == ".git" || part == "target" || part == ".verus-mutants"
+        })
+    })
 }
 
 #[cfg(test)]
