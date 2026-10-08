@@ -196,6 +196,37 @@ same exhaustive-operator behavior as `--in-diff`.
 directories, so concurrent mutations cannot share edited source or stale build
 artifacts. Baselines are repeated per worker to preserve that isolation.
 
+### Accepted-survivor baseline
+
+`--baseline FILE` (TOML, or JSON when the name ends in `.json`) lists survivors
+the project accepts. With it, a run fails only on survivors that are not
+listed, on listed entries whose mutants ran and no longer survive, and on
+entries that match no discovered mutant (a ratchet: fixed gaps and renamed code
+must leave the file). Entries outside the current `--file`, `--in-diff` or
+limit scope are ignored. `--minimum-kill-rate` and
+`--require-zero-survivors-for` do not count accepted survivors.
+
+```toml
+[[mutant]]
+file = "crates/x/src/pool.rs"          # workspace-relative
+function = "alloc"                      # omit for manual mutants
+operator = "condition-to-true"
+replacement = "true"
+status = "equivalent"                   # or "open"
+reason = "the guard is implied by the loop invariant"   # required for equivalent
+# owner = "alice"                       # required for open
+# original = "n > 0"                    # optional: disambiguates same-key mutants
+```
+
+JSON uses the same fields under a top-level `"mutants"` array.
+
+The stable id is the tuple `(file, function, operator, replacement text)`.
+Line numbers, byte offsets and the `VM-` hash are excluded, so unrelated edits
+do not invalidate entries. An entry covers every mutant with that key in the
+function (add `original` to pick one); changing the mutated source text, the
+function name, or the file moves the mutant and the entry becomes "no longer
+exists". Unlisted survivors are printed as ready-to-edit `[[mutant]]` blocks.
+
 Results have distinct meanings:
 
 - `killed-by-proof`: Verus rejected a well-formed mutant with a recognized
