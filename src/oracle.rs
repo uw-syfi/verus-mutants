@@ -18,7 +18,57 @@ pub struct Execution {
     pub diagnostic: Option<String>,
 }
 
-pub fn command_for(mutant: &Mutant, verification: &VerificationConfig) -> Result<Vec<String>> {
+/// Expands `{package}`, `{module}`, `{function}` and `{worker}` in a command
+/// template for one mutant on one worker.
+///
+/// `{module}` is the Verus module path of the mutated file, derived from its
+/// path below `src/` (`src/a/b.rs` and `src/a/b/mod.rs` give `a::b`). For
+/// `lib.rs` and `main.rs` it is the package's crate name. `{function}` is the
+/// mutated function, empty for manual mutants.
+pub fn expand(template: &[String], mutant: &Mutant, worker: usize) -> Vec<String> {
+    let package = mutant.oracle.package.as_deref().unwrap_or(&mutant.package);
+    let module = module_path(mutant);
+    let function = mutant.function.as_deref().unwrap_or("");
+    let worker = worker.to_string();
+    template
+        .iter()
+        .map(|part| {
+            part.replace("{package}", package)
+                .replace("{module}", &module)
+                .replace("{function}", function)
+                .replace("{worker}", &worker)
+        })
+        .collect()
+}
+
+fn module_path(mutant: &Mutant) -> String {
+    let components: Vec<_> = mutant
+        .file
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let below_src = match components.iter().rposition(|part| part == "src") {
+        Some(index) => &components[index + 1..],
+        None => &components[..],
+    };
+    let mut parts: Vec<String> = below_src.to_vec();
+    if let Some(last) = parts.last_mut() {
+        *last = last.strip_suffix(".rs").unwrap_or(last).to_owned();
+    }
+    if matches!(parts.last().map(String::as_str), Some("mod")) {
+        parts.pop();
+    }
+    if parts.len() == 1 && matches!(parts[0].as_str(), "lib" | "main") {
+        return mutant.package.replace('-', "_");
+    }
+    parts.join("::")
+}
+
+pub fn command_for(
+    mutant: &Mutant,
+    verification: &VerificationConfig,
+    worker: usize,
+) -> Result<Vec<String>> {
     let template = if mutant.oracle.command.is_empty() {
         &verification.command
     } else {
@@ -29,11 +79,7 @@ pub fn command_for(mutant: &Mutant, verification: &VerificationConfig) -> Result
         "mutant {} has an empty oracle command",
         mutant.id
     );
-    let package = mutant.oracle.package.as_deref().unwrap_or(&mutant.package);
-    Ok(template
-        .iter()
-        .map(|part| part.replace("{package}", package))
-        .collect())
+    Ok(expand(template, mutant, worker))
 }
 
 pub fn execute(
@@ -41,8 +87,9 @@ pub fn execute(
     target: &std::path::Path,
     mutant: &Mutant,
     verification: &VerificationConfig,
+    worker: usize,
 ) -> Result<Execution> {
-    let command = command_for(mutant, verification)?;
+    let command = command_for(mutant, verification, worker)?;
     let raw = run_process(source, target, &command, verification.timeout_seconds)?;
     let (outcome, diagnostic) = classify(mutant, raw.returncode, raw.timed_out, &raw.output);
     Ok(Execution {
@@ -291,7 +338,7 @@ fn tail(text: &str, bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, has_positive_verification, passed_test_count};
+    use super::{classify, expand, has_positive_verification, passed_test_count};
     use crate::model::{Campaign, Mutant, OracleKind, OracleSpec, Outcome};
     use std::path::PathBuf;
 
@@ -371,6 +418,49 @@ mod tests {
             "error[E0425]: cannot find value `g` in this scope",
         );
         assert_eq!(result.0, Outcome::Invalid);
+    }
+
+    #[test]
+    fn command_placeholders_expand_per_mutant_and_worker() {
+        let template: Vec<String> = [
+            "env",
+            "VOL=target-{worker}",
+            "verify",
+            "-p",
+            "{package}",
+            "--verify-module",
+            "{module}",
+            "--fn={function}",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let mut m = mutant(OracleKind::Verus);
+        m.package = "my-crate".into();
+        m.function = Some("run".into());
+        for (file, module) in [
+            ("crates/x/src/mgr_rc.rs", "mgr_rc"),
+            ("crates/x/src/a/b.rs", "a::b"),
+            ("crates/x/src/a/b/mod.rs", "a::b"),
+            ("crates/x/src/lib.rs", "my_crate"),
+        ] {
+            m.file = PathBuf::from(file);
+            let command = expand(&template, &m, 3);
+            assert_eq!(
+                command,
+                [
+                    "env",
+                    "VOL=target-3",
+                    "verify",
+                    "-p",
+                    "my-crate",
+                    "--verify-module",
+                    module,
+                    "--fn=run"
+                ],
+                "{file}"
+            );
+        }
     }
 
     #[test]

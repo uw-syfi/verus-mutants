@@ -76,6 +76,13 @@ command = ["cargo", "verus", "build", "-p", "{package}"]
 baseline_command = ["cargo", "verus", "build", "--workspace"]
 timeout_seconds = 240
 
+# Command placeholders (verification.command, baseline_command and command
+# oracles): {package}; {module}, the Verus module path of the mutated file
+# below src/ (a/b.rs gives a::b, lib.rs gives the crate name); {function}, the
+# mutated function; {worker}, the zero-based --jobs worker index. For example
+#   command = ["env", "TARGET_VOL=vol-{worker}", "./verify", "cargo", "verus",
+#              "build", "-p", "{package}", "--", "--verify-module", "{module}"]
+
 [operators]
 # Optional assurance-hardening campaigns. Disabled by default because these
 # mutate the oracle itself rather than only executable implementation code.

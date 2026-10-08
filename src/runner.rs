@@ -253,7 +253,7 @@ fn execute_worker(
     let target = sandbox.path().join("target");
     materialize::copy_project(root, &source)?;
     let log_root = root.join("target/verus-mutants/logs");
-    let commands = baseline_commands(&mutants, verification)?;
+    let commands = baseline_commands(&mutants, verification, worker)?;
     for (key, baseline) in &commands {
         let command = &baseline.command;
         eprintln!("worker {worker} baseline: {}", command.join(" "));
@@ -278,7 +278,7 @@ fn execute_worker(
         let original_source = fs::read(&mutated_path)
             .with_context(|| format!("reading {} before mutation", mutated_path.display()))?;
         materialize::apply(&source, &mutant)?;
-        let execution = oracle::execute(&source, &target, &mutant, verification);
+        let execution = oracle::execute(&source, &target, &mutant, verification, worker);
         fs::write(&mutated_path, original_source)
             .with_context(|| format!("restoring {} after mutation", mutated_path.display()))?;
         let execution = execution?;
@@ -404,10 +404,11 @@ struct Baseline {
 fn unique_commands(
     mutants: &[Mutant],
     verification: &config::VerificationConfig,
+    worker: usize,
 ) -> Result<BTreeMap<String, Baseline>> {
     let mut commands = BTreeMap::new();
     for mutant in mutants {
-        let command = oracle::command_for(mutant, verification)?;
+        let command = oracle::command_for(mutant, verification, worker)?;
         let encoded = serde_json::to_vec(&(
             &command,
             &mutant.oracle.kind,
@@ -426,8 +427,9 @@ fn unique_commands(
 fn baseline_commands(
     mutants: &[Mutant],
     verification: &config::VerificationConfig,
+    worker: usize,
 ) -> Result<BTreeMap<String, Baseline>> {
-    let mut commands = unique_commands(mutants, verification)?;
+    let mut commands = unique_commands(mutants, verification, worker)?;
     if verification.baseline_command.is_empty()
         || !mutants
             .iter()
@@ -436,26 +438,14 @@ fn baseline_commands(
         return Ok(commands);
     }
     commands.retain(|_, baseline| baseline.kind != crate::model::OracleKind::Verus);
-    // `{package}` in the baseline command expands to each package that has a
-    // Verus mutant, so a per-package baseline verifies exactly what the
-    // mutants will.
-    let packages: BTreeSet<&str> = mutants
+    // Placeholders in the baseline command expand per Verus mutant, so a
+    // `-p {package}` or `--verify-module {module}` baseline verifies exactly
+    // the scope its mutants do. Identical expansions share one baseline run.
+    for mutant in mutants
         .iter()
         .filter(|mutant| mutant.oracle.kind == crate::model::OracleKind::Verus)
-        .map(|mutant| {
-            mutant
-                .oracle
-                .package
-                .as_deref()
-                .unwrap_or(mutant.package.as_str())
-        })
-        .collect();
-    for package in packages {
-        let command: Vec<String> = verification
-            .baseline_command
-            .iter()
-            .map(|part| part.replace("{package}", package))
-            .collect();
+    {
+        let command = oracle::expand(&verification.baseline_command, mutant, worker);
         let encoded = serde_json::to_vec(&(
             &command,
             &crate::model::OracleKind::Verus,
@@ -532,7 +522,7 @@ mod tests {
             baseline_command: vec!["verify".into(), "-p".into(), "{package}".into()],
             ..config::VerificationConfig::default()
         };
-        let commands = super::baseline_commands(&mutants, &verification).unwrap();
+        let commands = super::baseline_commands(&mutants, &verification, 0).unwrap();
         assert_eq!(commands.len(), 1);
         let baseline = commands.values().next().unwrap();
         assert_eq!(baseline.command, ["verify", "-p", "fixture"]);
