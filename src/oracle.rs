@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
 use crate::config::VerificationConfig;
-use crate::model::{Mutant, OracleKind, Outcome};
+use crate::model::{KillLocation, Mutant, OracleKind, Outcome};
 
 pub struct Execution {
     pub outcome: Outcome,
@@ -16,6 +16,7 @@ pub struct Execution {
     pub elapsed_seconds: f64,
     pub output: String,
     pub diagnostic: Option<String>,
+    pub kill: Option<KillLocation>,
 }
 
 /// Expands `{package}`, `{module}`, `{function}` and `{worker}` in a command
@@ -92,8 +93,12 @@ pub fn execute(
     let command = command_for(mutant, verification, worker)?;
     let raw = run_process(source, target, &command, verification.timeout_seconds)?;
     let (outcome, diagnostic) = classify(mutant, raw.returncode, raw.timed_out, &raw.output);
+    let kill = (outcome == Outcome::KilledByProof)
+        .then(|| kill_location(&raw.output))
+        .flatten();
     Ok(Execution {
         outcome,
+        kill,
         command,
         returncode: raw.returncode,
         elapsed_seconds: raw.elapsed_seconds,
@@ -263,6 +268,21 @@ const PROOF_DIAGNOSTICS: &[&str] = &[
     "constructed value may fail to meet its declared type invariant",
 ];
 
+/// Kind label for each entry of `PROOF_DIAGNOSTICS`, in the same order.
+const DIAGNOSTIC_KINDS: &[&str] = &[
+    "postcondition",
+    "precondition",
+    "precondition",
+    "invariant",
+    "assertion",
+    "decreases",
+    "division",
+    "arithmetic",
+    "arithmetic",
+    "bounds",
+    "other",
+];
+
 fn proof_failure(output: &str) -> Option<&'static str> {
     if let Some(pattern) = PROOF_DIAGNOSTICS
         .iter()
@@ -276,6 +296,42 @@ fn proof_failure(output: &str) -> Option<&'static str> {
     verification_errors(output)
         .filter(|errors| *errors > 0)
         .map(|_| "verification error")
+}
+
+/// Locates the first failed proof obligation in Verus output: the diagnostic
+/// class and the `--> file:line:col` line that follows its `error:` header.
+pub fn kill_location(output: &str) -> Option<KillLocation> {
+    let mut lines = output.lines();
+    while let Some(line) = lines.next() {
+        let Some(message) = line.strip_prefix("error: ") else {
+            continue;
+        };
+        let Some(kind) = PROOF_DIAGNOSTICS
+            .iter()
+            .position(|pattern| message.starts_with(pattern))
+            .map(|index| DIAGNOSTIC_KINDS[index])
+        else {
+            continue;
+        };
+        let Some(arrow) = lines
+            .next()
+            .and_then(|next| next.trim_start().strip_prefix("--> "))
+        else {
+            continue;
+        };
+        let mut parts = arrow.rsplitn(3, ':');
+        let column = parts.next()?.trim().parse().ok()?;
+        let line = parts.next()?.trim().parse().ok()?;
+        let file = parts.next()?.to_owned();
+        return Some(KillLocation {
+            kind: kind.into(),
+            file,
+            line,
+            column,
+            from_ensures: kind == "postcondition",
+        });
+    }
+    None
 }
 
 /// The error count from Verus's `verification results::` summary line.
@@ -338,7 +394,7 @@ fn tail(text: &str, bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, expand, has_positive_verification, passed_test_count};
+    use super::{classify, expand, has_positive_verification, kill_location, passed_test_count};
     use crate::model::{Campaign, Mutant, OracleKind, OracleSpec, Outcome};
     use std::path::PathBuf;
 
@@ -461,6 +517,24 @@ mod tests {
                 "{file}"
             );
         }
+    }
+
+    #[test]
+    fn kill_location_reports_file_line_and_ensures() {
+        let post = "note: x\n\nerror: postcondition not satisfied\n   --> crates/c/src/mgr_pages.rs:118:13\n    |\n118 |   final(self).rows(r) == 0,\n    |   ^^^ failed this postcondition\n...\n158 |   r\n    |   - at the end of the function body\n";
+        let kill = kill_location(post).unwrap();
+        assert_eq!(kill.file, "crates/c/src/mgr_pages.rs");
+        assert_eq!((kill.line, kill.column), (118, 13));
+        assert!(kill.from_ensures);
+        assert_eq!(kill.kind, "postcondition");
+
+        let body = "error: assertion failed\n   --> src/pool.rs:677:62\n";
+        let kill = kill_location(body).unwrap();
+        assert!(!kill.from_ensures);
+        assert_eq!((kill.kind.as_str(), kill.line), ("assertion", 677));
+
+        // A compile error is not a located kill.
+        assert!(kill_location("error[E0308]: mismatched types\n --> src/a.rs:1:1").is_none());
     }
 
     #[test]

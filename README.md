@@ -207,6 +207,11 @@ Results have distinct meanings:
 - `timeout`: inconclusive.
 - `infrastructure-failure`: the oracle failed without its expected rejection.
 
+Each killed-by-proof result in `summary.json` carries a `kill` object with the
+failed obligation's `kind`, `file`, `line`, `column`, and `from_ensures` (true
+when the error is at a postcondition rather than an in-body assert, invariant,
+call precondition, or arithmetic check). The terminal report counts both.
+
 Invalid mutants and timeouts are not kills. A clean Verus baseline must report
 at least one verified function and zero errors. A focused test baseline must
 pass at least `required_test_count` tests, or one test by default.

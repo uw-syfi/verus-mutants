@@ -299,6 +299,7 @@ fn execute_worker(
             returncode: execution.returncode,
             elapsed_seconds: execution.elapsed_seconds,
             diagnostic: execution.diagnostic,
+            kill: execution.kill,
             log,
         });
         if fail_fast && stop {
