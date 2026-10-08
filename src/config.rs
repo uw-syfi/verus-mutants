@@ -44,6 +44,10 @@ impl Default for ProjectConfig {
 pub struct VerificationConfig {
     pub command: Vec<String>,
     pub baseline_command: Vec<String>,
+    /// Command for redundancy operators, run once per affected package. It
+    /// must verify the whole package (no `{module}` scoping), because callers
+    /// live in other modules. Defaults to `baseline_command`, then `command`.
+    pub redundancy_command: Vec<String>,
     pub timeout_seconds: u64,
 }
 
@@ -58,6 +62,7 @@ impl Default for VerificationConfig {
                 "{package}".into(),
             ],
             baseline_command: Vec::new(),
+            redundancy_command: Vec::new(),
             timeout_seconds: 240,
         }
     }
@@ -80,6 +85,14 @@ pub struct OperatorsConfig {
     pub match_arm_body_substitution: bool,
     pub external_body_insertion: bool,
     pub external_body_visibility_widening: bool,
+    /// Redundancy campaign: a survivor is a finding, not a test failure.
+    /// Enabled here or with `--redundancy` / `--operator NAME`.
+    pub drop_requires: bool,
+    pub drop_ensures: bool,
+    pub dead_refusal: bool,
+    /// A `return` expression whose text, ignoring whitespace, contains one of
+    /// these marks its branch as a refusal for `dead-refusal`.
+    pub refusal_patterns: Vec<String>,
 }
 
 impl Default for OperatorsConfig {
@@ -99,6 +112,10 @@ impl Default for OperatorsConfig {
             match_arm_body_substitution: true,
             external_body_insertion: false,
             external_body_visibility_widening: false,
+            drop_requires: false,
+            drop_ensures: false,
+            dead_refusal: false,
+            refusal_patterns: vec!["return Err(".into(), "return None".into()],
         }
     }
 }
@@ -244,6 +261,7 @@ impl ManualMutantConfig {
             original: self.original,
             replacement: self.replacement,
             expected_occurrences: self.expected_occurrences,
+            detail: None,
             oracle: OracleSpec {
                 kind: oracle.kind,
                 package: oracle.package,

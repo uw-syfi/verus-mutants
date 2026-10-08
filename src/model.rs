@@ -46,7 +46,20 @@ pub struct Mutant {
     pub original: String,
     pub replacement: String,
     pub expected_occurrences: usize,
+    /// Human-readable subject of a redundancy finding: the contract clause or
+    /// the refusal branch the mutation targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub oracle: OracleSpec,
+}
+
+/// Operators whose survival means redundancy, not a weak check.
+pub const REDUNDANCY_OPERATORS: &[&str] = &["drop-requires", "drop-ensures", "dead-refusal"];
+
+impl Mutant {
+    pub fn is_redundancy(&self) -> bool {
+        REDUNDANCY_OPERATORS.contains(&self.operator.as_str())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -56,6 +69,8 @@ pub enum Outcome {
     KilledByTest,
     KilledByPolicy,
     Survived,
+    /// A redundancy mutant that still verified: a finding, not a failure.
+    Redundant,
     Invalid,
     Timeout,
     InfrastructureFailure,
@@ -88,6 +103,9 @@ pub struct MutantResult {
     /// Present for killed-by-proof results whose log has a located error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kill: Option<KillLocation>,
+    /// Packages verified for this mutant, in order, for redundancy operators.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_packages: Vec<String>,
     pub log: PathBuf,
 }
 

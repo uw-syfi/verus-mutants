@@ -60,6 +60,9 @@ src/runner.rs       baselines, selection, and campaign orchestration
 src/report.rs       terminal and JSON reports
 ```
 
+The redundancy end-to-end test (`tests/redundancy_e2e.rs`) needs Verus: see its
+header comment.
+
 Projects use `.verus-mutants.toml` only for overrides or curated domain
 mutants.
 
@@ -196,6 +199,47 @@ same exhaustive-operator behavior as `--in-diff`.
 directories, so concurrent mutations cannot share edited source or stale build
 artifacts. Baselines are repeated per worker to preserve that isolation.
 
+### Redundancy campaign
+
+Three more operators turn the verifier into a redundancy detector. For them a
+mutant that still verifies is a finding about the specification or code, not a
+weak check, so it is reported as `redundant` in its own "Redundant" report
+section and never fails the run (survivors stay in "Survivors"). They are off
+by default. `--redundancy` enables all three; `--operator NAME` enables just
+that one (or set `drop_requires`, `drop_ensures`, `dead_refusal` under
+`[operators]`).
+
+| Operator | Edit | Redundant means |
+| --- | --- | --- |
+| `drop-requires` | delete one `requires` clause of a function | the function and all its callers verify without it: the interface is over-constrained |
+| `drop-ensures` | delete one `ensures` clause | every caller verifies without it: no caller uses the guarantee |
+| `dead-refusal` | insert `assert(false);` at the start of a branch whose own statements `return` a refusal | the branch is unreachable: the run-time check can become a proof |
+
+`drop-*` apply to exec and proof functions, including trait methods. A sole
+clause is deleted with its keyword. `dead-refusal` looks at `if` and `else`
+blocks and `match` arms (not loops); a `return` expression is a refusal if its
+text, ignoring whitespace, contains one of `[operators] refusal_patterns`
+(default `return Err(`, `return None`; add named refusal enums such as
+`return Refusal::`).
+
+Callers can live anywhere, so a redundancy mutant is verified package by
+package: the defining package first, then every Verus workspace package that
+transitively depends on it (nearest first), stopping at the first failure. The
+mutant is redundant only if all verify, and each finding lists the packages
+that were re-verified. The command is `verification.redundancy_command`, else
+`baseline_command`, else `command`, with `{package}` set per package. It must
+verify the whole package: do not scope it with `{module}`, since callers are in
+other modules. Each package is also verified clean once per worker as a
+baseline. Sampling (`--limit-per-operator`, `--limit`), `--in-diff`, `--file`,
+`--jobs` and `--operator` apply as for other operators; the baseline file only
+lists survivors. Each finding also carries `detail` in `summary.json` (the
+clause text or branch condition) and `verified_packages`.
+
+A finding is a prompt to look, not an instruction to delete: an unused
+`ensures` may document an API, and a dead refusal may guard against a future
+caller. Cost per mutant is one whole-package verification per re-verified
+package, so it is higher than a module-scoped exec mutant.
+
 ### Accepted-survivor baseline
 
 `--baseline FILE` (TOML, or JSON when the name ends in `.json`) lists survivors
@@ -234,6 +278,7 @@ Results have distinct meanings:
 - `killed-by-test` or `killed-by-policy`: a configured dynamic or structural
   oracle rejected it.
 - `survived`: the oracle accepted the mutant. This is the result to inspect.
+- `redundant`: a redundancy-operator mutant that still verified (see above).
 - `invalid`: the edit did not produce a type-correct, supported Verus program.
 - `timeout`: inconclusive.
 - `infrastructure-failure`: the oracle failed without its expected rejection.

@@ -107,6 +107,90 @@ pub fn execute(
     })
 }
 
+/// Command template for redundancy operators.
+pub fn redundancy_template(verification: &VerificationConfig) -> &[String] {
+    if !verification.redundancy_command.is_empty() {
+        &verification.redundancy_command
+    } else if !verification.baseline_command.is_empty() {
+        &verification.baseline_command
+    } else {
+        &verification.command
+    }
+}
+
+pub fn redundancy_command_for(
+    mutant: &Mutant,
+    verification: &VerificationConfig,
+    worker: usize,
+    package: &str,
+) -> Vec<String> {
+    let mut scoped = mutant.clone();
+    scoped.oracle.package = Some(package.to_owned());
+    expand(redundancy_template(verification), &scoped, worker)
+}
+
+/// Verifies the mutated tree package by package (the defining crate first,
+/// then its dependents), stopping at the first package that does not verify.
+/// The mutant survives only if every package verifies, and the result lists the
+/// packages that ran.
+pub fn execute_redundancy(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    mutant: &Mutant,
+    verification: &VerificationConfig,
+    worker: usize,
+    packages: &[String],
+) -> Result<(Execution, Vec<String>)> {
+    let mut output = String::new();
+    let mut elapsed = 0.0;
+    let mut ran = Vec::new();
+    let mut first_command = Vec::new();
+    for package in packages {
+        let command = redundancy_command_for(mutant, verification, worker, package);
+        let raw = run_process(source, target, &command, verification.timeout_seconds)?;
+        elapsed += raw.elapsed_seconds;
+        output.push_str(&format!(
+            "==== {} ====\n{}\n",
+            command.join(" "),
+            raw.output
+        ));
+        ran.push(package.clone());
+        if first_command.is_empty() {
+            first_command = command;
+        }
+        let (outcome, diagnostic) = classify(mutant, raw.returncode, raw.timed_out, &raw.output);
+        if outcome != Outcome::Survived {
+            let kill = (outcome == Outcome::KilledByProof)
+                .then(|| kill_location(&raw.output))
+                .flatten();
+            return Ok((
+                Execution {
+                    outcome,
+                    kill,
+                    command: first_command,
+                    returncode: raw.returncode,
+                    elapsed_seconds: elapsed,
+                    output,
+                    diagnostic,
+                },
+                ran,
+            ));
+        }
+    }
+    Ok((
+        Execution {
+            outcome: Outcome::Redundant,
+            kill: None,
+            command: first_command,
+            returncode: Some(0),
+            elapsed_seconds: elapsed,
+            output,
+            diagnostic: None,
+        },
+        ran,
+    ))
+}
+
 pub fn baseline(
     source: &std::path::Path,
     target: &std::path::Path,
@@ -411,6 +495,7 @@ mod tests {
             original: "a".into(),
             replacement: "b".into(),
             expected_occurrences: 1,
+            detail: None,
             oracle: OracleSpec {
                 kind,
                 package: None,
@@ -552,5 +637,39 @@ mod tests {
         let output = "test result: ok. 1 passed; 0 failed\n\
                       test result: ok. 0 passed; 0 failed\n";
         assert_eq!(passed_test_count(output), 1);
+    }
+
+    fn redundancy_fixture() -> (Mutant, crate::config::VerificationConfig) {
+        let verification = crate::config::VerificationConfig {
+            // Verifies every package except `bad`.
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "if [ {package} = bad ]; then echo 'error: postcondition not satisfied'; exit 1; fi; \
+                 echo 'verification results:: 1 verified, 0 errors'"
+                    .into(),
+            ],
+            ..crate::config::VerificationConfig::default()
+        };
+        (mutant(OracleKind::Verus), verification)
+    }
+
+    #[test]
+    fn redundancy_survives_only_if_every_package_verifies() {
+        let (mutant, verification) = redundancy_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let all = ["a".to_string(), "b".to_string()];
+        let (execution, ran) =
+            super::execute_redundancy(dir.path(), &target, &mutant, &verification, 0, &all)
+                .unwrap();
+        assert_eq!(execution.outcome, Outcome::Redundant);
+        assert_eq!(ran, all);
+        let breaking = ["a".to_string(), "bad".to_string(), "never".to_string()];
+        let (execution, ran) =
+            super::execute_redundancy(dir.path(), &target, &mutant, &verification, 0, &breaking)
+                .unwrap();
+        assert_eq!(execution.outcome, Outcome::KilledByProof);
+        assert_eq!(ran, ["a", "bad"], "stops at the first failing package");
     }
 }

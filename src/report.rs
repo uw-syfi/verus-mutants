@@ -62,6 +62,10 @@ pub fn publish(root: &Path, summary: &RunSummary, json_stdout: bool) -> Result<(
         println!("  {} killed by tests", count(Outcome::KilledByTest));
         println!("  {} killed by policy", count(Outcome::KilledByPolicy));
         println!("  {} survived", count(Outcome::Survived));
+        println!(
+            "  {} redundant (findings, not failures)",
+            count(Outcome::Redundant)
+        );
         println!("  {} invalid", count(Outcome::Invalid));
         println!("  {} timed out", count(Outcome::Timeout));
         println!(
@@ -78,7 +82,41 @@ pub fn publish(root: &Path, summary: &RunSummary, json_stdout: bool) -> Result<(
                 100.0 * killed as f64 / (killed + survived) as f64
             );
         }
+        print_section("Survivors", summary, Outcome::Survived);
+        print_section("Redundant", summary, Outcome::Redundant);
         println!("summary: {}", final_path.display());
     }
     Ok(())
+}
+
+/// One line per result with this outcome, naming the function, the clause or
+/// branch (for redundancy operators), the file, and the packages verified.
+fn print_section(title: &str, summary: &RunSummary, outcome: Outcome) {
+    let rows: Vec<_> = summary
+        .results
+        .iter()
+        .filter(|result| result.outcome == outcome)
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    println!("\n{title} ({}):", rows.len());
+    for result in rows {
+        let mutant = &result.mutant;
+        let subject = mutant
+            .detail
+            .clone()
+            .unwrap_or_else(|| format!("{} -> {}", mutant.original, mutant.replacement));
+        println!(
+            "  {} {}::{} [{}] {}",
+            mutant.operator,
+            mutant.file.display(),
+            mutant.function.as_deref().unwrap_or("<manual>"),
+            mutant.id,
+            subject
+        );
+        if !result.verified_packages.is_empty() {
+            println!("    re-verified: {}", result.verified_packages.join(", "));
+        }
+    }
 }

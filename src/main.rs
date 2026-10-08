@@ -38,6 +38,10 @@ struct CommonArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+    /// Also discover the redundancy operators (drop-requires, drop-ensures,
+    /// dead-refusal). Naming one with --operator enables just that one.
+    #[arg(long)]
+    redundancy: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -102,6 +106,7 @@ fn main() -> Result<()> {
             common: CommonArgs {
                 manifest_path: PathBuf::from("."),
                 json: false,
+                redundancy: false,
             },
             manual_only: false,
             automatic_only: false,
@@ -119,10 +124,11 @@ fn main() -> Result<()> {
             jobs: 1,
         }))
     }) {
-        Command::List(args) => runner::list(&args.manifest_path, args.json),
+        Command::List(args) => runner::list(&args.manifest_path, args.json, args.redundancy),
         Command::Run(args) => runner::run(runner::RunOptions {
             manifest: &args.common.manifest_path,
             json: args.common.json,
+            redundancy: args.common.redundancy,
             manual_only: args.manual_only,
             automatic_only: args.automatic_only,
             fail_fast: args.fail_fast,
