@@ -560,9 +560,12 @@ fn baseline_commands(
         for package in reverify_packages(mutant, dependents) {
             let command = oracle::redundancy_command_for(mutant, verification, worker, &package);
             let key = hex::encode(Sha256::digest(serde_json::to_vec(&command)?));
+            // `cargo verus build -p X` also verifies X's verified dependencies, so a
+            // package an earlier baseline already covered prints no summary: only
+            // the exit status is checked.
             commands.entry(key[..12].to_string()).or_insert(Baseline {
                 command,
-                kind: crate::model::OracleKind::Verus,
+                kind: crate::model::OracleKind::Command,
                 required_test_count: None,
             });
         }
