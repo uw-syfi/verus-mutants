@@ -200,17 +200,44 @@ fn classify(
     }
 }
 
+/// Verus diagnostics that report a failed proof obligation in a well-typed
+/// program. Order matters only for the reported label.
+const PROOF_DIAGNOSTICS: &[&str] = &[
+    "postcondition not satisfied",
+    "precondition not satisfied",
+    "requires not satisfied",
+    "invariant not satisfied",
+    "assertion failed",
+    "decreases not satisfied",
+    "possible division by zero",
+    "possible arithmetic underflow/overflow",
+    "possible bit shift underflow/overflow",
+    "possible array index out of bounds",
+    "constructed value may fail to meet its declared type invariant",
+];
+
 fn proof_failure(output: &str) -> Option<&'static str> {
-    [
-        "postcondition not satisfied",
-        "precondition not satisfied",
-        "invariant not satisfied",
-        "assertion failed",
-        "decreases not satisfied",
-        "constructed value may fail to meet its declared type invariant",
-    ]
-    .into_iter()
-    .find(|pattern| output.contains(pattern))
+    if let Some(pattern) = PROOF_DIAGNOSTICS
+        .iter()
+        .find(|pattern| output.contains(**pattern))
+    {
+        return Some(pattern);
+    }
+    // Verus prints a `verification results:: N verified, M errors` line only
+    // after the program type-checked, so M > 0 is a proof failure even when the
+    // diagnostic is one this list does not know.
+    verification_errors(output)
+        .filter(|errors| *errors > 0)
+        .map(|_| "verification error")
+}
+
+/// The error count from Verus's `verification results::` summary line.
+fn verification_errors(output: &str) -> Option<usize> {
+    output.lines().find_map(|line| {
+        let rest = line.strip_prefix("verification results:: ")?;
+        let (_, errors) = rest.split_once(" verified, ")?;
+        errors.split_whitespace().next()?.parse().ok()
+    })
 }
 
 fn looks_invalid(output: &str) -> bool {
@@ -315,6 +342,35 @@ mod tests {
             "error[E0308]: mismatched types",
         );
         assert_eq!(compile.0, Outcome::Invalid);
+    }
+
+    #[test]
+    fn arithmetic_and_requires_diagnostics_are_proof_kills() {
+        for text in [
+            "error: possible division by zero\n --> src/lib.rs:5:9",
+            "error: requires not satisfied\n --> src/lib.rs:5:9",
+            "error: possible arithmetic underflow/overflow",
+            "error: possible array index out of bounds",
+        ] {
+            let result = classify(&mutant(OracleKind::Verus), Some(101), false, text);
+            assert_eq!(result.0, Outcome::KilledByProof, "{text}");
+        }
+        // An unrecognized diagnostic is still a kill once the verification
+        // summary reports errors, because type checking already succeeded.
+        let result = classify(
+            &mutant(OracleKind::Verus),
+            Some(101),
+            false,
+            "error: some future diagnostic\nverification results:: 3 verified, 1 errors",
+        );
+        assert_eq!(result.0, Outcome::KilledByProof);
+        let result = classify(
+            &mutant(OracleKind::Verus),
+            Some(101),
+            false,
+            "error[E0425]: cannot find value `g` in this scope",
+        );
+        assert_eq!(result.0, Outcome::Invalid);
     }
 
     #[test]
