@@ -112,6 +112,7 @@ fn into_mutant(
         original,
         replacement: candidate.replacement,
         expected_occurrences: 1,
+        detail: None,
         oracle: oracle.to_spec(&candidate.package),
     })
 }

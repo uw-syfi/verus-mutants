@@ -11,6 +11,8 @@ pub struct WorkspacePackage {
     pub root: PathBuf,
     pub source_roots: Vec<PathBuf>,
     pub is_verus: bool,
+    /// Workspace members this package depends on (normal and build edges).
+    pub dependencies: Vec<String>,
 }
 
 pub fn workspace_packages(root: &Path) -> Result<Vec<WorkspacePackage>> {
@@ -22,6 +24,12 @@ pub fn workspace_packages(root: &Path) -> Result<Vec<WorkspacePackage>> {
     }
     let metadata = command.exec().context("running cargo metadata")?;
     let workspace_members: BTreeSet<_> = metadata.workspace_members.iter().collect();
+    let workspace_names: BTreeSet<&str> = metadata
+        .packages
+        .iter()
+        .filter(|p| workspace_members.contains(&p.id))
+        .map(|p| p.name.as_str())
+        .collect();
     let mut packages = Vec::new();
     for package in metadata
         .packages
@@ -48,6 +56,15 @@ pub fn workspace_packages(root: &Path) -> Result<Vec<WorkspacePackage>> {
             root: package_root,
             source_roots: roots,
             is_verus,
+            dependencies: package
+                .dependencies
+                .iter()
+                .filter(|dependency| {
+                    dependency.kind != cargo_metadata::DependencyKind::Development
+                        && workspace_names.contains(dependency.name.as_str())
+                })
+                .map(|dependency| dependency.name.clone())
+                .collect(),
         });
     }
     Ok(packages)
@@ -80,6 +97,33 @@ fn is_verified(package: &Package) -> bool {
         .unwrap_or(false)
 }
 
+/// Verus workspace packages that transitively depend on `package`, nearest
+/// first (ties by name). These are the crates whose callers a contract change
+/// in `package` can break.
+pub fn verus_dependents(packages: &[WorkspacePackage], package: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut frontier = vec![package.to_owned()];
+    while !frontier.is_empty() {
+        let mut next: Vec<String> = packages
+            .iter()
+            .filter(|candidate| {
+                candidate.is_verus
+                    && candidate.name != package
+                    && !found.contains(&candidate.name)
+                    && candidate
+                        .dependencies
+                        .iter()
+                        .any(|dependency| frontier.contains(dependency))
+            })
+            .map(|candidate| candidate.name.clone())
+            .collect();
+        next.sort();
+        found.extend(next.iter().cloned());
+        frontier = next;
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::workspace_packages;
@@ -104,5 +148,25 @@ mod tests {
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].name, "fixture");
         assert!(packages[0].is_verus);
+    }
+
+    #[test]
+    fn dependents_are_transitive_nearest_first_and_skip_non_verus() {
+        let package = |name: &str, dependencies: &[&str], is_verus: bool| super::WorkspacePackage {
+            name: name.into(),
+            root: Default::default(),
+            source_roots: Vec::new(),
+            is_verus,
+            dependencies: dependencies.iter().map(|d| d.to_string()).collect(),
+        };
+        let packages = [
+            package("base", &[], true),
+            package("mid", &["base"], true),
+            package("host-only", &["base"], false),
+            package("top", &["mid"], true),
+            package("unrelated", &[], true),
+        ];
+        assert_eq!(super::verus_dependents(&packages, "base"), ["mid", "top"]);
+        assert!(super::verus_dependents(&packages, "top").is_empty());
     }
 }

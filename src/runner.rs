@@ -18,8 +18,18 @@ use crate::oracle;
 use crate::report;
 use crate::rust;
 
-pub fn list(manifest: &Path, json: bool) -> Result<()> {
-    let loaded = config::load(manifest)?;
+/// Turns on the redundancy operators named by `--redundancy` or `--operator`.
+fn enable_redundancy(loaded: &mut config::LoadedConfig, all: bool, selected: &[String]) {
+    let operators = &mut loaded.config.operators;
+    let wanted = |name: &str| all || selected.iter().any(|s| s == name);
+    operators.drop_requires |= wanted("drop-requires");
+    operators.drop_ensures |= wanted("drop-ensures");
+    operators.dead_refusal |= wanted("dead-refusal");
+}
+
+pub fn list(manifest: &Path, json: bool, redundancy: bool) -> Result<()> {
+    let mut loaded = config::load(manifest)?;
+    enable_redundancy(&mut loaded, redundancy, &[]);
     let mutants = discover_all(&loaded, false, false)?;
     report::print_list(&mutants, json)
 }
@@ -27,6 +37,7 @@ pub fn list(manifest: &Path, json: bool) -> Result<()> {
 pub struct RunOptions<'a> {
     pub manifest: &'a Path,
     pub json: bool,
+    pub redundancy: bool,
     pub manual_only: bool,
     pub automatic_only: bool,
     pub fail_fast: bool,
@@ -47,6 +58,7 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
     let RunOptions {
         manifest,
         json,
+        redundancy,
         manual_only,
         automatic_only,
         fail_fast,
@@ -73,7 +85,8 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
             "--minimum-kill-rate must be between 0 and 1"
         );
     }
-    let loaded = config::load(manifest)?;
+    let mut loaded = config::load(manifest)?;
+    enable_redundancy(&mut loaded, redundancy, selected_operators);
     let root = &loaded.root;
     let accepted = baseline.map(baseline::load).transpose()?;
     let mut mutants = discover_all(&loaded, manual_only, automatic_only)?;
@@ -137,40 +150,42 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
     let digest = source_digest(root)?;
     let log_root = root.join("target/verus-mutants/logs");
     fs::create_dir_all(&log_root)?;
+    let dependents = dependents_of(&mutants, root)?;
     let worker_count = jobs.min(mutants.len());
     let mut assignments = vec![Vec::new(); worker_count];
     for (index, mutant) in mutants.into_iter().enumerate() {
         assignments[index % worker_count].push(mutant);
     }
-    let mut results =
-        if worker_count == 1 {
-            execute_worker(
-                0,
-                root,
-                assignments.pop().expect("one worker assignment"),
-                &loaded.config.verification,
-                fail_fast,
-            )?
-        } else {
-            std::thread::scope(|scope| -> Result<Vec<MutantResult>> {
-                let mut handles = Vec::new();
-                for (worker, assignment) in assignments.into_iter().enumerate() {
-                    let verification = &loaded.config.verification;
-                    handles.push(scope.spawn(move || {
-                        execute_worker(worker, root, assignment, verification, false)
-                    }));
-                }
-                let mut combined = Vec::new();
-                for handle in handles {
-                    combined.extend(
-                        handle
-                            .join()
-                            .map_err(|_| anyhow::anyhow!("mutation worker panicked"))??,
-                    );
-                }
-                Ok(combined)
-            })?
-        };
+    let mut results = if worker_count == 1 {
+        execute_worker(
+            0,
+            root,
+            assignments.pop().expect("one worker assignment"),
+            &loaded.config.verification,
+            &dependents,
+            fail_fast,
+        )?
+    } else {
+        std::thread::scope(|scope| -> Result<Vec<MutantResult>> {
+            let mut handles = Vec::new();
+            for (worker, assignment) in assignments.into_iter().enumerate() {
+                let verification = &loaded.config.verification;
+                let dependents = &dependents;
+                handles.push(scope.spawn(move || {
+                    execute_worker(worker, root, assignment, verification, dependents, false)
+                }));
+            }
+            let mut combined = Vec::new();
+            for handle in handles {
+                combined.extend(
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("mutation worker panicked"))??,
+                );
+            }
+            Ok(combined)
+        })?
+    };
     results.sort_by(|left, right| left.mutant.id.cmp(&right.mutant.id));
     let summary = RunSummary {
         schema_version: 1,
@@ -310,6 +325,7 @@ fn execute_worker(
     root: &Path,
     mutants: Vec<Mutant>,
     verification: &config::VerificationConfig,
+    dependents: &Dependents,
     fail_fast: bool,
 ) -> Result<Vec<MutantResult>> {
     let sandbox = TempDir::new().context("creating campaign worker sandbox")?;
@@ -317,7 +333,7 @@ fn execute_worker(
     let target = sandbox.path().join("target");
     materialize::copy_project(root, &source)?;
     let log_root = root.join("target/verus-mutants/logs");
-    let commands = baseline_commands(&mutants, verification, worker)?;
+    let commands = baseline_commands(&mutants, verification, worker, dependents)?;
     for (key, baseline) in &commands {
         let command = &baseline.command;
         eprintln!("worker {worker} baseline: {}", command.join(" "));
@@ -342,7 +358,23 @@ fn execute_worker(
         let original_source = fs::read(&mutated_path)
             .with_context(|| format!("reading {} before mutation", mutated_path.display()))?;
         materialize::apply(&source, &mutant)?;
-        let execution = oracle::execute(&source, &target, &mutant, verification, worker);
+        let mut verified_packages = Vec::new();
+        let execution = if mutant.is_redundancy() {
+            oracle::execute_redundancy(
+                &source,
+                &target,
+                &mutant,
+                verification,
+                worker,
+                &reverify_packages(&mutant, dependents),
+            )
+            .map(|(execution, ran)| {
+                verified_packages = ran;
+                execution
+            })
+        } else {
+            oracle::execute(&source, &target, &mutant, verification, worker)
+        };
         fs::write(&mutated_path, original_source)
             .with_context(|| format!("restoring {} after mutation", mutated_path.display()))?;
         let execution = execution?;
@@ -364,6 +396,7 @@ fn execute_worker(
             elapsed_seconds: execution.elapsed_seconds,
             diagnostic: execution.diagnostic,
             kill: execution.kill,
+            verified_packages,
             log,
         });
         if fail_fast && stop {
@@ -489,7 +522,55 @@ fn unique_commands(
     Ok(commands)
 }
 
+/// Verus dependents of each package that has redundancy mutants.
+type Dependents = BTreeMap<String, Vec<String>>;
+
+fn dependents_of(mutants: &[Mutant], root: &Path) -> Result<Dependents> {
+    let mut dependents = Dependents::new();
+    if !mutants.iter().any(Mutant::is_redundancy) {
+        return Ok(dependents);
+    }
+    let packages = cargo::workspace_packages(root)?;
+    for mutant in mutants.iter().filter(|mutant| mutant.is_redundancy()) {
+        dependents
+            .entry(mutant.package.clone())
+            .or_insert_with(|| cargo::verus_dependents(&packages, &mutant.package));
+    }
+    Ok(dependents)
+}
+
+/// The defining package, then every Verus package that depends on it.
+fn reverify_packages(mutant: &Mutant, dependents: &Dependents) -> Vec<String> {
+    let mut packages = vec![mutant.package.clone()];
+    packages.extend(dependents.get(&mutant.package).cloned().unwrap_or_default());
+    packages
+}
+
 fn baseline_commands(
+    mutants: &[Mutant],
+    verification: &config::VerificationConfig,
+    worker: usize,
+    dependents: &Dependents,
+) -> Result<BTreeMap<String, Baseline>> {
+    let (redundancy, ordinary): (Vec<_>, Vec<_>) =
+        mutants.iter().cloned().partition(Mutant::is_redundancy);
+    let mut commands = baseline_commands_ordinary(&ordinary, verification, worker)?;
+    // Redundancy mutants verify whole packages; baseline each one once.
+    for mutant in &redundancy {
+        for package in reverify_packages(mutant, dependents) {
+            let command = oracle::redundancy_command_for(mutant, verification, worker, &package);
+            let key = hex::encode(Sha256::digest(serde_json::to_vec(&command)?));
+            commands.entry(key[..12].to_string()).or_insert(Baseline {
+                command,
+                kind: crate::model::OracleKind::Verus,
+                required_test_count: None,
+            });
+        }
+    }
+    Ok(commands)
+}
+
+fn baseline_commands_ordinary(
     mutants: &[Mutant],
     verification: &config::VerificationConfig,
     worker: usize,
@@ -587,7 +668,8 @@ mod tests {
             baseline_command: vec!["verify".into(), "-p".into(), "{package}".into()],
             ..config::VerificationConfig::default()
         };
-        let commands = super::baseline_commands(&mutants, &verification, 0).unwrap();
+        let commands =
+            super::baseline_commands(&mutants, &verification, 0, &Default::default()).unwrap();
         assert_eq!(commands.len(), 1);
         let baseline = commands.values().next().unwrap();
         assert_eq!(baseline.command, ["verify", "-p", "fixture"]);

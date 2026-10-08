@@ -10,9 +10,9 @@ use verus_syn::punctuated::Punctuated;
 use verus_syn::spanned::Spanned;
 use verus_syn::visit::{self, Visit};
 use verus_syn::{
-    Assert, AssertForall, Assume, BinOp, Expr, ExprBinary, ExprCall, ExprClosure, ExprIf, ExprLit,
-    ExprMatch, ExprStruct, ExprUnary, ExprWhile, FnMode, ImplItemFn, ItemFn, ItemImpl, ItemMacro,
-    ItemMod, Lit, Local, Meta, Pat, RevealHide, Stmt, Token, Type, UnOp, Visibility,
+    Assert, AssertForall, Assume, BinOp, Block, Expr, ExprBinary, ExprCall, ExprClosure, ExprIf,
+    ExprLit, ExprMatch, ExprStruct, ExprUnary, ExprWhile, FnMode, ImplItemFn, ItemFn, ItemImpl,
+    ItemMacro, ItemMod, Lit, Local, Meta, Pat, RevealHide, Stmt, Token, Type, UnOp, Visibility,
 };
 use walkdir::WalkDir;
 
@@ -194,12 +194,23 @@ impl ExecVisitor<'_> {
     }
 
     fn add(&mut self, span: Span, operator: &str, replacement: String) {
-        if self.function.is_none() {
-            return;
-        }
         let Some((start, end)) = byte_range(self.source, span) else {
             return;
         };
+        self.add_range(start, end, operator, replacement, None);
+    }
+
+    fn add_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        operator: &str,
+        replacement: String,
+        detail: Option<String>,
+    ) {
+        if self.function.is_none() {
+            return;
+        }
         if start >= end || end > self.source.len() {
             return;
         }
@@ -244,8 +255,144 @@ impl ExecVisitor<'_> {
             original,
             replacement,
             expected_occurrences: 1,
+            detail,
             oracle,
         });
+    }
+
+    /// `drop-requires` and `drop-ensures`: delete one clause of the function's
+    /// contract. Survival means no verified caller needs it (`requires`) or
+    /// uses it (`ensures`).
+    fn discover_contract(&mut self, sig: &verus_syn::Signature) {
+        let spec = &sig.spec;
+        if self.operators.drop_requires {
+            if let Some(requires) = &spec.requires {
+                self.drop_clauses(
+                    "drop-requires",
+                    requires.token.span(),
+                    &requires.exprs.exprs,
+                );
+            }
+        }
+        if self.operators.drop_ensures {
+            if let Some(ensures) = &spec.ensures {
+                self.drop_clauses("drop-ensures", ensures.token.span(), &ensures.exprs.exprs);
+            }
+        }
+    }
+
+    fn drop_clauses(&mut self, operator: &str, keyword: Span, exprs: &Punctuated<Expr, Token![,]>) {
+        let count = exprs.len();
+        let ranges: Vec<_> = exprs
+            .pairs()
+            .map(|pair| {
+                let expr = byte_range(self.source, pair.value().span())?;
+                let comma = pair
+                    .punct()
+                    .and_then(|comma| byte_range(self.source, comma.span()));
+                Some((expr, comma))
+            })
+            .collect();
+        let Some((keyword_start, _)) = byte_range(self.source, keyword) else {
+            return;
+        };
+        for index in 0..count {
+            let Some(((start, end), comma)) = ranges[index] else {
+                continue;
+            };
+            // Delete through the next clause's start, so the remaining
+            // clauses keep their separators. The last clause leaves its
+            // predecessor's comma behind, which Verus accepts as a trailing
+            // comma. A sole clause takes its keyword with it.
+            let (from, to) = if count == 1 {
+                (keyword_start, comma.map_or(end, |(_, comma_end)| comma_end))
+            } else if let Some(Some(((next, _), _))) =
+                ranges.get(index + 1).map(|r| r.map(|r| (r.0, r.1)))
+            {
+                (start, next)
+            } else {
+                (start, comma.map_or(end, |(_, comma_end)| comma_end))
+            };
+            let text = self.source[start..end]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let keyword_name = operator.trim_start_matches("drop-");
+            self.add_range(
+                from,
+                to,
+                operator,
+                String::new(),
+                Some(format!("{keyword_name} {}", truncate(&text, 160))),
+            );
+        }
+    }
+
+    fn is_refusal(&self, block: &Block) -> bool {
+        block.stmts.iter().any(|statement| {
+            let Stmt::Expr(Expr::Return(returned), _) = statement else {
+                return false;
+            };
+            self.is_refusal_return(returned)
+        })
+    }
+
+    fn is_refusal_return(&self, returned: &verus_syn::ExprReturn) -> bool {
+        let Some((start, end)) = byte_range(self.source, returned.span()) else {
+            return false;
+        };
+        let text: String = self.source[start..end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        self.operators.refusal_patterns.iter().any(|pattern| {
+            let pattern: String = pattern.chars().filter(|c| !c.is_whitespace()).collect();
+            !pattern.is_empty() && text.contains(&pattern)
+        })
+    }
+
+    /// `dead-refusal`: open a refusal block with `assert(false);`. Survival
+    /// means Verus proves the branch unreachable, so its run-time check can
+    /// become a proof obligation.
+    fn dead_refusal_block(&mut self, block: &Block, label: String) {
+        if !self.operators.dead_refusal || !self.is_refusal(block) {
+            return;
+        }
+        let Some((start, end)) = byte_range(self.source, block.brace_token.span.open()) else {
+            return;
+        };
+        self.add_range(
+            start,
+            end,
+            "dead-refusal",
+            "{ assert(false);".into(),
+            Some(label),
+        );
+    }
+
+    fn dead_refusal_arm(&mut self, arm: &verus_syn::Arm) {
+        let label = format!(
+            "match arm `{}`",
+            truncate(&span_text(self.source, arm.pat.span()), 80)
+        );
+        match &*arm.body {
+            Expr::Block(block) => self.dead_refusal_block(&block.block, label),
+            Expr::Return(returned)
+                if self.operators.dead_refusal && self.is_refusal_return(returned) =>
+            {
+                if let Some((start, end)) = byte_range(self.source, returned.span()) {
+                    let original = self.source[start..end].to_string();
+                    self.add_range(
+                        start,
+                        end,
+                        "dead-refusal",
+                        format!("{{ assert(false); {original} }}"),
+                        Some(label),
+                    );
+                }
+            }
+            _ => {}
+        }
     }
 
     fn add_condition(&mut self, expr: &Expr) {
@@ -319,9 +466,25 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
         visit::visit_expr_call(self, node);
     }
 
+    fn visit_trait_item_fn(&mut self, node: &'ast verus_syn::TraitItemFn) {
+        if !is_cfg_gated(&node.attrs)
+            && !self.excluded_functions.is_match(node.sig.ident.to_string())
+        {
+            let previous = self.function.replace(node.sig.ident.to_string());
+            self.discover_contract(&node.sig);
+            self.function = previous;
+        }
+        visit::visit_trait_item_fn(self, node);
+    }
+
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         if is_cfg_gated(&node.attrs) {
             return;
+        }
+        if !self.excluded_functions.is_match(node.sig.ident.to_string()) {
+            let previous = self.function.replace(node.sig.ident.to_string());
+            self.discover_contract(&node.sig);
+            self.function = previous;
         }
         if !(Self::in_exec(&node.sig.mode)
             || self.operators.mutate_spec_functions && Self::in_spec(&node.sig.mode))
@@ -352,6 +515,11 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
         if is_cfg_gated(&node.attrs) {
             return;
         }
+        if !self.excluded_functions.is_match(node.sig.ident.to_string()) {
+            let previous = self.function.replace(node.sig.ident.to_string());
+            self.discover_contract(&node.sig);
+            self.function = previous;
+        }
         if !(Self::in_exec(&node.sig.mode)
             || self.operators.mutate_spec_functions && Self::in_spec(&node.sig.mode))
             || self.excluded_functions.is_match(node.sig.ident.to_string())
@@ -379,6 +547,13 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
 
     fn visit_expr_if(&mut self, node: &'ast ExprIf) {
         self.add_condition(&node.cond);
+        let condition = truncate(&span_text(self.source, node.cond.span()), 120);
+        self.dead_refusal_block(&node.then_branch, format!("if {condition}"));
+        if let Some((_, otherwise)) = &node.else_branch {
+            if let Expr::Block(block) = &**otherwise {
+                self.dead_refusal_block(&block.block, format!("else of if {condition}"));
+            }
+        }
         visit::visit_expr_if(self, node);
     }
 
@@ -515,6 +690,9 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
     }
 
     fn visit_expr_match(&mut self, node: &'ast ExprMatch) {
+        for arm in &node.arms {
+            self.dead_refusal_arm(arm);
+        }
         if self.operators.match_arm_body_substitution && node.arms.len() > 1 {
             for (index, arm) in node.arms.iter().enumerate() {
                 let replacement = &node.arms[(index + 1) % node.arms.len()].body;
@@ -655,6 +833,26 @@ fn has_external_body(attributes: &[verus_syn::Attribute]) -> bool {
     })
 }
 
+fn span_text(source: &str, span: Span) -> String {
+    byte_range(source, span)
+        .map(|(start, end)| {
+            source[start..end]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
+fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        text.to_owned()
+    } else {
+        let cut: String = text.chars().take(limit).collect();
+        format!("{cut}...")
+    }
+}
+
 fn byte_range(source: &str, span: Span) -> Option<(usize, usize)> {
     let start = byte_offset(source, span.start())?;
     let end = byte_offset(source, span.end())?;
@@ -727,6 +925,7 @@ fn check(x: i32) -> bool
             root: directory.path().to_path_buf(),
             source_roots: vec![directory.path().join("src")],
             is_verus: true,
+            dependencies: Vec::new(),
         };
         let mut mutants = Vec::new();
         discover_file(
@@ -824,6 +1023,7 @@ fn check(x: i32) -> bool
             root: directory.path().to_path_buf(),
             source_roots: vec![directory.path().join("src")],
             is_verus: true,
+            dependencies: Vec::new(),
         };
         let mut mutants = Vec::new();
         discover_file(
@@ -927,5 +1127,118 @@ mod tests { fn inner(x: u32) -> u32 { x + 11 } }
             .collect();
         let expected: BTreeSet<_> = ["5", "8", "10"].into_iter().collect();
         assert_eq!(touched, expected);
+    }
+
+    fn redundancy_operators() -> OperatorsConfig {
+        OperatorsConfig {
+            drop_requires: true,
+            drop_ensures: true,
+            dead_refusal: true,
+            ..OperatorsConfig::default()
+        }
+    }
+
+    fn mutated(source: &str, operator: &str) -> Vec<(String, String)> {
+        discover_source(source, &redundancy_operators())
+            .iter()
+            .filter(|m| m.operator == operator)
+            .map(|m| (m.detail.clone().unwrap_or_default(), apply_to(source, m)))
+            .collect()
+    }
+
+    const CONTRACT: &str = "verus! {\npub fn f(x: u32) -> (r: u32)\n    requires\n        x < 100,\n        x < 200,\n    ensures\n        r == x * 2,\n        r % 2 == 0,\n{\n    x * 2\n}\n}\n";
+
+    #[test]
+    fn redundancy_operators_are_off_by_default() {
+        let mutants = discover_source(CONTRACT, &OperatorsConfig::default());
+        assert!(mutants.iter().all(|m| !m.is_redundancy()));
+    }
+
+    #[test]
+    fn drop_requires_deletes_one_clause_at_a_time() {
+        let drops = mutated(CONTRACT, "drop-requires");
+        assert_eq!(drops.len(), 2);
+        let details: Vec<_> = drops.iter().map(|d| d.0.as_str()).collect();
+        assert_eq!(details, ["requires x < 100", "requires x < 200"]);
+        assert!(drops[0]
+            .1
+            .contains("requires\n        x < 200,\n    ensures"));
+        assert!(
+            drops[1]
+                .1
+                .contains("requires\n        x < 100,\n        \n    ensures")
+                || drops[1].1.contains("x < 100,\n        ensures"),
+            "{}",
+            drops[1].1
+        );
+        for (_, source) in &drops {
+            verus_syn::parse_file(source).expect("mutant parses");
+        }
+    }
+
+    #[test]
+    fn dropping_the_only_clause_removes_its_keyword() {
+        let source = "verus! {\nfn f(x: u32)\n    requires x < 5,\n{\n}\n}\n";
+        let drops = mutated(source, "drop-requires");
+        assert_eq!(drops.len(), 1);
+        assert!(!drops[0].1.contains("requires"), "{}", drops[0].1);
+        verus_syn::parse_file(&drops[0].1).expect("mutant parses");
+    }
+
+    #[test]
+    fn drop_ensures_covers_each_clause_and_proof_fns() {
+        let drops = mutated(CONTRACT, "drop-ensures");
+        let details: Vec<_> = drops.iter().map(|d| d.0.as_str()).collect();
+        assert_eq!(details, ["ensures r == x * 2", "ensures r % 2 == 0"]);
+        assert!(!drops[1].1.contains("r % 2"));
+        let lemma = "verus! {\nproof fn l(x: int)\n    ensures x == x, x + 0 == x,\n{\n}\n}\n";
+        assert_eq!(mutated(lemma, "drop-ensures").len(), 2);
+    }
+
+    #[test]
+    fn dead_refusal_asserts_false_in_refusal_branches_only() {
+        let source = r#"verus! {
+fn f(x: u32, o: Option<u32>) -> Result<u32, ()> {
+    if x >= 100 {
+        return Err(());
+    }
+    if x == 7 {
+        return Ok(1);
+    }
+    match o {
+        None => return Err(()),
+        Some(v) => { if v > 3 { return Ok(0); } else { return Ok(v) } }
+    }
+}
+}
+"#;
+        let found = mutated(source, "dead-refusal");
+        let details: Vec<_> = found.iter().map(|d| d.0.as_str()).collect();
+        assert_eq!(details, ["if x >= 100", "match arm `None`"], "{details:?}");
+        assert!(found[0]
+            .1
+            .contains("if x >= 100 { assert(false);\n        return Err(());"));
+        assert!(found[1]
+            .1
+            .contains("None => { assert(false); return Err(()) }"));
+        for (_, mutated) in &found {
+            verus_syn::parse_file(mutated).expect("mutant parses");
+        }
+    }
+
+    #[test]
+    fn refusal_patterns_are_configurable() {
+        let source = "verus! {\nfn f(x: u32) -> Refusal {\n    if x > 1 {\n        return Refusal::TooBig;\n    }\n    Refusal::Ok\n}\n}\n";
+        assert!(mutated(source, "dead-refusal").is_empty());
+        let operators = OperatorsConfig {
+            dead_refusal: true,
+            refusal_patterns: vec!["return Refusal::".into()],
+            ..OperatorsConfig::default()
+        };
+        let found: Vec<_> = discover_source(source, &operators)
+            .into_iter()
+            .filter(|m| m.operator == "dead-refusal")
+            .collect();
+        assert_eq!(found.len(), 1);
     }
 }

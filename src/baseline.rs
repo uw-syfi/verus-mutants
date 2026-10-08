@@ -196,6 +196,7 @@ mod tests {
             original: "x".into(),
             replacement: replacement.into(),
             expected_occurrences: 1,
+            detail: None,
             oracle: OracleSpec {
                 kind: OracleKind::Verus,
                 package: None,
@@ -216,6 +217,7 @@ mod tests {
             elapsed_seconds: 0.0,
             diagnostic: None,
             kill: None,
+            verified_packages: Vec::new(),
             log: PathBuf::new(),
         }
     }
