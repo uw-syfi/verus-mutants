@@ -1,0 +1,12 @@
+[package]
+name = "app"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata.verus]
+verify = true
+
+[dependencies]
+base = { path = "../base" }
+vstd = { git = "https://github.com/verus-lang/verus.git", rev = "3a4d30bcdc4571e7927af97be9c4664973083eda" }
