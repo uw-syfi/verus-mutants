@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
 use crate::config::VerificationConfig;
-use crate::model::{Mutant, OracleKind, Outcome};
+use crate::model::{KillLocation, Mutant, OracleKind, Outcome};
 
 pub struct Execution {
     pub outcome: Outcome,
@@ -16,9 +16,60 @@ pub struct Execution {
     pub elapsed_seconds: f64,
     pub output: String,
     pub diagnostic: Option<String>,
+    pub kill: Option<KillLocation>,
 }
 
-pub fn command_for(mutant: &Mutant, verification: &VerificationConfig) -> Result<Vec<String>> {
+/// Expands `{package}`, `{module}`, `{function}` and `{worker}` in a command
+/// template for one mutant on one worker.
+///
+/// `{module}` is the Verus module path of the mutated file, derived from its
+/// path below `src/` (`src/a/b.rs` and `src/a/b/mod.rs` give `a::b`). For
+/// `lib.rs` and `main.rs` it is the package's crate name. `{function}` is the
+/// mutated function, empty for manual mutants.
+pub fn expand(template: &[String], mutant: &Mutant, worker: usize) -> Vec<String> {
+    let package = mutant.oracle.package.as_deref().unwrap_or(&mutant.package);
+    let module = module_path(mutant);
+    let function = mutant.function.as_deref().unwrap_or("");
+    let worker = worker.to_string();
+    template
+        .iter()
+        .map(|part| {
+            part.replace("{package}", package)
+                .replace("{module}", &module)
+                .replace("{function}", function)
+                .replace("{worker}", &worker)
+        })
+        .collect()
+}
+
+fn module_path(mutant: &Mutant) -> String {
+    let components: Vec<_> = mutant
+        .file
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let below_src = match components.iter().rposition(|part| part == "src") {
+        Some(index) => &components[index + 1..],
+        None => &components[..],
+    };
+    let mut parts: Vec<String> = below_src.to_vec();
+    if let Some(last) = parts.last_mut() {
+        *last = last.strip_suffix(".rs").unwrap_or(last).to_owned();
+    }
+    if matches!(parts.last().map(String::as_str), Some("mod")) {
+        parts.pop();
+    }
+    if parts.len() == 1 && matches!(parts[0].as_str(), "lib" | "main") {
+        return mutant.package.replace('-', "_");
+    }
+    parts.join("::")
+}
+
+pub fn command_for(
+    mutant: &Mutant,
+    verification: &VerificationConfig,
+    worker: usize,
+) -> Result<Vec<String>> {
     let template = if mutant.oracle.command.is_empty() {
         &verification.command
     } else {
@@ -29,11 +80,7 @@ pub fn command_for(mutant: &Mutant, verification: &VerificationConfig) -> Result
         "mutant {} has an empty oracle command",
         mutant.id
     );
-    let package = mutant.oracle.package.as_deref().unwrap_or(&mutant.package);
-    Ok(template
-        .iter()
-        .map(|part| part.replace("{package}", package))
-        .collect())
+    Ok(expand(template, mutant, worker))
 }
 
 pub fn execute(
@@ -41,12 +88,17 @@ pub fn execute(
     target: &std::path::Path,
     mutant: &Mutant,
     verification: &VerificationConfig,
+    worker: usize,
 ) -> Result<Execution> {
-    let command = command_for(mutant, verification)?;
+    let command = command_for(mutant, verification, worker)?;
     let raw = run_process(source, target, &command, verification.timeout_seconds)?;
     let (outcome, diagnostic) = classify(mutant, raw.returncode, raw.timed_out, &raw.output);
+    let kill = (outcome == Outcome::KilledByProof)
+        .then(|| kill_location(&raw.output))
+        .flatten();
     Ok(Execution {
         outcome,
+        kill,
         command,
         returncode: raw.returncode,
         elapsed_seconds: raw.elapsed_seconds,
@@ -200,17 +252,95 @@ fn classify(
     }
 }
 
+/// Verus diagnostics that report a failed proof obligation in a well-typed
+/// program. Order matters only for the reported label.
+const PROOF_DIAGNOSTICS: &[&str] = &[
+    "postcondition not satisfied",
+    "precondition not satisfied",
+    "requires not satisfied",
+    "invariant not satisfied",
+    "assertion failed",
+    "decreases not satisfied",
+    "possible division by zero",
+    "possible arithmetic underflow/overflow",
+    "possible bit shift underflow/overflow",
+    "possible array index out of bounds",
+    "constructed value may fail to meet its declared type invariant",
+];
+
+/// Kind label for each entry of `PROOF_DIAGNOSTICS`, in the same order.
+const DIAGNOSTIC_KINDS: &[&str] = &[
+    "postcondition",
+    "precondition",
+    "precondition",
+    "invariant",
+    "assertion",
+    "decreases",
+    "division",
+    "arithmetic",
+    "arithmetic",
+    "bounds",
+    "other",
+];
+
 fn proof_failure(output: &str) -> Option<&'static str> {
-    [
-        "postcondition not satisfied",
-        "precondition not satisfied",
-        "invariant not satisfied",
-        "assertion failed",
-        "decreases not satisfied",
-        "constructed value may fail to meet its declared type invariant",
-    ]
-    .into_iter()
-    .find(|pattern| output.contains(pattern))
+    if let Some(pattern) = PROOF_DIAGNOSTICS
+        .iter()
+        .find(|pattern| output.contains(**pattern))
+    {
+        return Some(pattern);
+    }
+    // Verus prints a `verification results:: N verified, M errors` line only
+    // after the program type-checked, so M > 0 is a proof failure even when the
+    // diagnostic is one this list does not know.
+    verification_errors(output)
+        .filter(|errors| *errors > 0)
+        .map(|_| "verification error")
+}
+
+/// Locates the first failed proof obligation in Verus output: the diagnostic
+/// class and the `--> file:line:col` line that follows its `error:` header.
+pub fn kill_location(output: &str) -> Option<KillLocation> {
+    let mut lines = output.lines();
+    while let Some(line) = lines.next() {
+        let Some(message) = line.strip_prefix("error: ") else {
+            continue;
+        };
+        let Some(kind) = PROOF_DIAGNOSTICS
+            .iter()
+            .position(|pattern| message.starts_with(pattern))
+            .map(|index| DIAGNOSTIC_KINDS[index])
+        else {
+            continue;
+        };
+        let Some(arrow) = lines
+            .next()
+            .and_then(|next| next.trim_start().strip_prefix("--> "))
+        else {
+            continue;
+        };
+        let mut parts = arrow.rsplitn(3, ':');
+        let column = parts.next()?.trim().parse().ok()?;
+        let line = parts.next()?.trim().parse().ok()?;
+        let file = parts.next()?.to_owned();
+        return Some(KillLocation {
+            kind: kind.into(),
+            file,
+            line,
+            column,
+            from_ensures: kind == "postcondition",
+        });
+    }
+    None
+}
+
+/// The error count from Verus's `verification results::` summary line.
+fn verification_errors(output: &str) -> Option<usize> {
+    output.lines().find_map(|line| {
+        let rest = line.strip_prefix("verification results:: ")?;
+        let (_, errors) = rest.split_once(" verified, ")?;
+        errors.split_whitespace().next()?.parse().ok()
+    })
 }
 
 fn looks_invalid(output: &str) -> bool {
@@ -264,7 +394,7 @@ fn tail(text: &str, bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, has_positive_verification, passed_test_count};
+    use super::{classify, expand, has_positive_verification, kill_location, passed_test_count};
     use crate::model::{Campaign, Mutant, OracleKind, OracleSpec, Outcome};
     use std::path::PathBuf;
 
@@ -315,6 +445,96 @@ mod tests {
             "error[E0308]: mismatched types",
         );
         assert_eq!(compile.0, Outcome::Invalid);
+    }
+
+    #[test]
+    fn arithmetic_and_requires_diagnostics_are_proof_kills() {
+        for text in [
+            "error: possible division by zero\n --> src/lib.rs:5:9",
+            "error: requires not satisfied\n --> src/lib.rs:5:9",
+            "error: possible arithmetic underflow/overflow",
+            "error: possible array index out of bounds",
+        ] {
+            let result = classify(&mutant(OracleKind::Verus), Some(101), false, text);
+            assert_eq!(result.0, Outcome::KilledByProof, "{text}");
+        }
+        // An unrecognized diagnostic is still a kill once the verification
+        // summary reports errors, because type checking already succeeded.
+        let result = classify(
+            &mutant(OracleKind::Verus),
+            Some(101),
+            false,
+            "error: some future diagnostic\nverification results:: 3 verified, 1 errors",
+        );
+        assert_eq!(result.0, Outcome::KilledByProof);
+        let result = classify(
+            &mutant(OracleKind::Verus),
+            Some(101),
+            false,
+            "error[E0425]: cannot find value `g` in this scope",
+        );
+        assert_eq!(result.0, Outcome::Invalid);
+    }
+
+    #[test]
+    fn command_placeholders_expand_per_mutant_and_worker() {
+        let template: Vec<String> = [
+            "env",
+            "VOL=target-{worker}",
+            "verify",
+            "-p",
+            "{package}",
+            "--verify-module",
+            "{module}",
+            "--fn={function}",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let mut m = mutant(OracleKind::Verus);
+        m.package = "my-crate".into();
+        m.function = Some("run".into());
+        for (file, module) in [
+            ("crates/x/src/mgr_rc.rs", "mgr_rc"),
+            ("crates/x/src/a/b.rs", "a::b"),
+            ("crates/x/src/a/b/mod.rs", "a::b"),
+            ("crates/x/src/lib.rs", "my_crate"),
+        ] {
+            m.file = PathBuf::from(file);
+            let command = expand(&template, &m, 3);
+            assert_eq!(
+                command,
+                [
+                    "env",
+                    "VOL=target-3",
+                    "verify",
+                    "-p",
+                    "my-crate",
+                    "--verify-module",
+                    module,
+                    "--fn=run"
+                ],
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
+    fn kill_location_reports_file_line_and_ensures() {
+        let post = "note: x\n\nerror: postcondition not satisfied\n   --> crates/c/src/mgr_pages.rs:118:13\n    |\n118 |   final(self).rows(r) == 0,\n    |   ^^^ failed this postcondition\n...\n158 |   r\n    |   - at the end of the function body\n";
+        let kill = kill_location(post).unwrap();
+        assert_eq!(kill.file, "crates/c/src/mgr_pages.rs");
+        assert_eq!((kill.line, kill.column), (118, 13));
+        assert!(kill.from_ensures);
+        assert_eq!(kill.kind, "postcondition");
+
+        let body = "error: assertion failed\n   --> src/pool.rs:677:62\n";
+        let kill = kill_location(body).unwrap();
+        assert!(!kill.from_ensures);
+        assert_eq!((kill.kind.as_str(), kill.line), ("assertion", 677));
+
+        // A compile error is not a located kill.
+        assert!(kill_location("error[E0308]: mismatched types\n --> src/a.rs:1:1").is_none());
     }
 
     #[test]

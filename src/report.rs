@@ -47,6 +47,18 @@ pub fn publish(root: &Path, summary: &RunSummary, json_stdout: bool) -> Result<(
         };
         println!("\n{} mutants", summary.results.len());
         println!("  {} killed by Verus", count(Outcome::KilledByProof));
+        let kills: Vec<_> = summary
+            .results
+            .iter()
+            .filter_map(|result| result.kill.as_ref())
+            .collect();
+        if !kills.is_empty() {
+            let ensures = kills.iter().filter(|kill| kill.from_ensures).count();
+            println!(
+                "    ({ensures} at an ensures clause, {} in-body)",
+                kills.len() - ensures
+            );
+        }
         println!("  {} killed by tests", count(Outcome::KilledByTest));
         println!("  {} killed by policy", count(Outcome::KilledByPolicy));
         println!("  {} survived", count(Outcome::Survived));

@@ -76,6 +76,13 @@ command = ["cargo", "verus", "build", "-p", "{package}"]
 baseline_command = ["cargo", "verus", "build", "--workspace"]
 timeout_seconds = 240
 
+# Command placeholders (verification.command, baseline_command and command
+# oracles): {package}; {module}, the Verus module path of the mutated file
+# below src/ (a/b.rs gives a::b, lib.rs gives the crate name); {function}, the
+# mutated function; {worker}, the zero-based --jobs worker index. For example
+#   command = ["env", "TARGET_VOL=vol-{worker}", "./verify", "cargo", "verus",
+#              "build", "-p", "{package}", "--", "--verify-module", "{module}"]
+
 [operators]
 # Optional assurance-hardening campaigns. Disabled by default because these
 # mutate the oracle itself rather than only executable implementation code.
@@ -126,11 +133,22 @@ Verus. A nonstandard test or command oracle can set `kind`, `command`,
 
 ## Mutation and oracle semantics
 
+Ghost code is never mutated: `let ghost`, `let tracked`, `Ghost<T>` and
+`Tracked<T>` bindings, `Ghost(..)` and `Tracked(..)` calls, `proof` blocks, and
+spec and proof functions (the last two only when `mutate_spec_functions` is
+off). Items gated by `#[cfg(test)]` or `#[cfg(feature = "...")]`
+(including `all(..)` containing one, or an `any(..)` whose alternatives are all
+gated) are skipped, since the default build does not verify them.
+
 The automatic campaign parses `verus!` bodies with `verus_syn`. By default it
 visits only default or `exec` function bodies. It does not mutate assertions,
 assumptions, quantifiers, proof closures, or loop proof clauses. Operators cover
 conditions, logical clauses, relational and arithmetic operators, literals,
-standalone effect statements, struct field values, and match-arm bodies.
+standalone effect statements (`;`-terminated calls and assignments), struct
+field values, and match-arm bodies. Struct-field substitution swaps a field's
+value with its successor's only when both are literals of one kind and suffix
+or casts to the same type, because the tool has no type information; shorthand
+fields are skipped.
 
 `mutate_contracts` and `mutate_spec_functions` enable a separate assurance
 hardening campaign. These mutations challenge whether the rest of the proof
@@ -178,6 +196,37 @@ same exhaustive-operator behavior as `--in-diff`.
 directories, so concurrent mutations cannot share edited source or stale build
 artifacts. Baselines are repeated per worker to preserve that isolation.
 
+### Accepted-survivor baseline
+
+`--baseline FILE` (TOML, or JSON when the name ends in `.json`) lists survivors
+the project accepts. With it, a run fails only on survivors that are not
+listed, on listed entries whose mutants ran and no longer survive, and on
+entries that match no discovered mutant (a ratchet: fixed gaps and renamed code
+must leave the file). Entries outside the current `--file`, `--in-diff` or
+limit scope are ignored. `--minimum-kill-rate` and
+`--require-zero-survivors-for` do not count accepted survivors.
+
+```toml
+[[mutant]]
+file = "crates/x/src/pool.rs"          # workspace-relative
+function = "alloc"                      # omit for manual mutants
+operator = "condition-to-true"
+replacement = "true"
+status = "equivalent"                   # or "open"
+reason = "the guard is implied by the loop invariant"   # required for equivalent
+# owner = "alice"                       # required for open
+# original = "n > 0"                    # optional: disambiguates same-key mutants
+```
+
+JSON uses the same fields under a top-level `"mutants"` array.
+
+The stable id is the tuple `(file, function, operator, replacement text)`.
+Line numbers, byte offsets and the `VM-` hash are excluded, so unrelated edits
+do not invalidate entries. An entry covers every mutant with that key in the
+function (add `original` to pick one); changing the mutated source text, the
+function name, or the file moves the mutant and the entry becomes "no longer
+exists". Unlisted survivors are printed as ready-to-edit `[[mutant]]` blocks.
+
 Results have distinct meanings:
 
 - `killed-by-proof`: Verus rejected a well-formed mutant with a recognized
@@ -188,6 +237,11 @@ Results have distinct meanings:
 - `invalid`: the edit did not produce a type-correct, supported Verus program.
 - `timeout`: inconclusive.
 - `infrastructure-failure`: the oracle failed without its expected rejection.
+
+Each killed-by-proof result in `summary.json` carries a `kill` object with the
+failed obligation's `kind`, `file`, `line`, `column`, and `from_ensures` (true
+when the error is at a postcondition rather than an in-body assert, invariant,
+call precondition, or arithmetic check). The terminal report counts both.
 
 Invalid mutants and timeouts are not kills. A clean Verus baseline must report
 at least one verified function and zero errors. A focused test baseline must

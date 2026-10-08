@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
+use crate::baseline;
 use crate::cargo;
 use crate::config;
 use crate::discover;
@@ -38,6 +39,7 @@ pub struct RunOptions<'a> {
     pub zero_survivor_operators: &'a [String],
     pub in_diff: Option<&'a str>,
     pub selected_files: &'a [PathBuf],
+    pub baseline: Option<&'a Path>,
     pub jobs: usize,
 }
 
@@ -57,6 +59,7 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
         zero_survivor_operators,
         in_diff,
         selected_files,
+        baseline,
         jobs,
     } = options;
     anyhow::ensure!(jobs > 0, "--jobs must be greater than zero");
@@ -72,7 +75,9 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
     }
     let loaded = config::load(manifest)?;
     let root = &loaded.root;
+    let accepted = baseline.map(baseline::load).transpose()?;
     let mut mutants = discover_all(&loaded, manual_only, automatic_only)?;
+    let discovered = mutants.clone();
     if !selected_ids.is_empty() {
         let selected: BTreeSet<_> = selected_ids.iter().collect();
         mutants.retain(|mutant| selected.contains(&mutant.id));
@@ -197,10 +202,27 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
             )
         })
         .count();
+    let verdict = accepted
+        .as_ref()
+        .map(|entries| baseline::evaluate(entries, &discovered, &summary.results));
+    let accepted_ids: BTreeSet<&str> = match (&accepted, &verdict) {
+        (Some(entries), Some(_)) => summary
+            .results
+            .iter()
+            .filter(|result| {
+                result.outcome == Outcome::Survived
+                    && entries.iter().any(|entry| entry.matches(&result.mutant))
+            })
+            .map(|result| result.mutant.id.as_str())
+            .collect(),
+        _ => BTreeSet::new(),
+    };
     let survived = summary
         .results
         .iter()
-        .filter(|result| result.outcome == Outcome::Survived)
+        .filter(|result| {
+            result.outcome == Outcome::Survived && !accepted_ids.contains(result.mutant.id.as_str())
+        })
         .count();
     let required: BTreeSet<_> = zero_survivor_operators.iter().collect();
     let observed_operators: BTreeSet<_> = summary
@@ -217,7 +239,9 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
         .results
         .iter()
         .filter(|result| {
-            result.outcome == Outcome::Survived && required.contains(&result.mutant.operator)
+            result.outcome == Outcome::Survived
+                && required.contains(&result.mutant.operator)
+                && !accepted_ids.contains(result.mutant.id.as_str())
         })
         .map(|result| result.mutant.id.as_str())
         .collect();
@@ -225,6 +249,16 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
         critical_survivors.is_empty(),
         "required operators have surviving mutants: {critical_survivors:?}"
     );
+    if let Some(verdict) = &verdict {
+        report_baseline(verdict);
+        anyhow::ensure!(
+            verdict.is_clean(),
+            "baseline check failed: {} new survivors, {} entries no longer survive, {} entries no longer exist",
+            verdict.unlisted.len(),
+            verdict.no_longer_surviving.len(),
+            verdict.no_longer_exist.len()
+        );
+    }
     if let Some(required) = minimum_kill_rate {
         let observed = if killed + survived == 0 {
             1.0
@@ -235,10 +269,40 @@ pub fn run(options: RunOptions<'_>) -> Result<()> {
             observed >= required,
             "mutation kill rate {observed:.3} is below required {required:.3}"
         );
-    } else if survived > 0 {
+    } else if survived > 0 && verdict.is_none() {
         anyhow::bail!("one or more mutants survived");
     }
     Ok(())
+}
+
+fn report_baseline(verdict: &baseline::Verdict) {
+    println!("\nbaseline: {} accepted survivors", verdict.accepted);
+    for result in &verdict.unlisted {
+        println!(
+            "  NEW survivor {} in {}; add to the baseline if intended:\n{}",
+            result.mutant.id,
+            result.mutant.file.display(),
+            baseline::suggest(result)
+        );
+    }
+    for entry in &verdict.no_longer_surviving {
+        println!(
+            "  STALE (no longer survives, remove it): {} {}::{} -> {:?}",
+            entry.operator,
+            entry.file.display(),
+            entry.function.as_deref().unwrap_or("<none>"),
+            entry.replacement
+        );
+    }
+    for entry in &verdict.no_longer_exist {
+        println!(
+            "  GONE (matches no mutant, remove or update it): {} {}::{} -> {:?}",
+            entry.operator,
+            entry.file.display(),
+            entry.function.as_deref().unwrap_or("<none>"),
+            entry.replacement
+        );
+    }
 }
 
 fn execute_worker(
@@ -253,7 +317,7 @@ fn execute_worker(
     let target = sandbox.path().join("target");
     materialize::copy_project(root, &source)?;
     let log_root = root.join("target/verus-mutants/logs");
-    let commands = baseline_commands(&mutants, verification)?;
+    let commands = baseline_commands(&mutants, verification, worker)?;
     for (key, baseline) in &commands {
         let command = &baseline.command;
         eprintln!("worker {worker} baseline: {}", command.join(" "));
@@ -278,7 +342,7 @@ fn execute_worker(
         let original_source = fs::read(&mutated_path)
             .with_context(|| format!("reading {} before mutation", mutated_path.display()))?;
         materialize::apply(&source, &mutant)?;
-        let execution = oracle::execute(&source, &target, &mutant, verification);
+        let execution = oracle::execute(&source, &target, &mutant, verification, worker);
         fs::write(&mutated_path, original_source)
             .with_context(|| format!("restoring {} after mutation", mutated_path.display()))?;
         let execution = execution?;
@@ -299,6 +363,7 @@ fn execute_worker(
             returncode: execution.returncode,
             elapsed_seconds: execution.elapsed_seconds,
             diagnostic: execution.diagnostic,
+            kill: execution.kill,
             log,
         });
         if fail_fast && stop {
@@ -404,10 +469,11 @@ struct Baseline {
 fn unique_commands(
     mutants: &[Mutant],
     verification: &config::VerificationConfig,
+    worker: usize,
 ) -> Result<BTreeMap<String, Baseline>> {
     let mut commands = BTreeMap::new();
     for mutant in mutants {
-        let command = oracle::command_for(mutant, verification)?;
+        let command = oracle::command_for(mutant, verification, worker)?;
         let encoded = serde_json::to_vec(&(
             &command,
             &mutant.oracle.kind,
@@ -426,8 +492,9 @@ fn unique_commands(
 fn baseline_commands(
     mutants: &[Mutant],
     verification: &config::VerificationConfig,
+    worker: usize,
 ) -> Result<BTreeMap<String, Baseline>> {
-    let mut commands = unique_commands(mutants, verification)?;
+    let mut commands = unique_commands(mutants, verification, worker)?;
     if verification.baseline_command.is_empty()
         || !mutants
             .iter()
@@ -436,20 +503,26 @@ fn baseline_commands(
         return Ok(commands);
     }
     commands.retain(|_, baseline| baseline.kind != crate::model::OracleKind::Verus);
-    let encoded = serde_json::to_vec(&(
-        &verification.baseline_command,
-        &crate::model::OracleKind::Verus,
-        Option::<usize>::None,
-    ))?;
-    let key = hex::encode(Sha256::digest(encoded));
-    commands.insert(
-        key[..12].to_string(),
-        Baseline {
-            command: verification.baseline_command.clone(),
+    // Placeholders in the baseline command expand per Verus mutant, so a
+    // `-p {package}` or `--verify-module {module}` baseline verifies exactly
+    // the scope its mutants do. Identical expansions share one baseline run.
+    for mutant in mutants
+        .iter()
+        .filter(|mutant| mutant.oracle.kind == crate::model::OracleKind::Verus)
+    {
+        let command = oracle::expand(&verification.baseline_command, mutant, worker);
+        let encoded = serde_json::to_vec(&(
+            &command,
+            &crate::model::OracleKind::Verus,
+            Option::<usize>::None,
+        ))?;
+        let key = hex::encode(Sha256::digest(encoded));
+        commands.entry(key[..12].to_string()).or_insert(Baseline {
+            command,
             kind: crate::model::OracleKind::Verus,
             required_test_count: None,
-        },
-    );
+        });
+    }
     Ok(commands)
 }
 
@@ -503,6 +576,21 @@ mod tests {
         )
         .unwrap();
         project
+    }
+
+    #[test]
+    fn baseline_command_expands_package_per_mutant_package() {
+        let project = project();
+        let loaded = config::load(project.path()).unwrap();
+        let mutants = discover_all(&loaded, false, false).unwrap();
+        let verification = config::VerificationConfig {
+            baseline_command: vec!["verify".into(), "-p".into(), "{package}".into()],
+            ..config::VerificationConfig::default()
+        };
+        let commands = super::baseline_commands(&mutants, &verification, 0).unwrap();
+        assert_eq!(commands.len(), 1);
+        let baseline = commands.values().next().unwrap();
+        assert_eq!(baseline.command, ["verify", "-p", "fixture"]);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+mod baseline;
 mod cargo;
 mod config;
 mod discover;
@@ -79,6 +80,11 @@ struct RunArgs {
     /// Mutate this workspace-relative file. May be repeated.
     #[arg(long = "file")]
     files: Vec<PathBuf>,
+    /// TOML or JSON file of accepted surviving mutants. The run fails only on
+    /// survivors it does not list, and on entries that no longer survive or
+    /// no longer exist.
+    #[arg(long)]
+    baseline: Option<PathBuf>,
     /// Number of isolated mutation workers.
     #[arg(long, default_value_t = 1)]
     jobs: usize,
@@ -109,6 +115,7 @@ fn main() -> Result<()> {
             zero_survivor_operators: Vec::new(),
             in_diff: None,
             files: Vec::new(),
+            baseline: None,
             jobs: 1,
         }))
     }) {
@@ -128,6 +135,7 @@ fn main() -> Result<()> {
             zero_survivor_operators: &args.zero_survivor_operators,
             in_diff: args.in_diff.as_deref(),
             selected_files: &args.files,
+            baseline: args.baseline.as_deref(),
             jobs: args.jobs,
         }),
     }

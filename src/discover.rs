@@ -6,12 +6,13 @@ use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use proc_macro2::{LineColumn, Span};
 use sha2::{Digest, Sha256};
+use verus_syn::punctuated::Punctuated;
 use verus_syn::spanned::Spanned;
 use verus_syn::visit::{self, Visit};
 use verus_syn::{
-    Assert, AssertForall, Assume, BinOp, Expr, ExprBinary, ExprClosure, ExprIf, ExprLit, ExprMatch,
-    ExprStruct, ExprUnary, ExprWhile, FnMode, ImplItemFn, ItemFn, ItemMacro, Lit, RevealHide, Stmt,
-    UnOp, Visibility,
+    Assert, AssertForall, Assume, BinOp, Expr, ExprBinary, ExprCall, ExprClosure, ExprIf, ExprLit,
+    ExprMatch, ExprStruct, ExprUnary, ExprWhile, FnMode, ImplItemFn, ItemFn, ItemImpl, ItemMacro,
+    ItemMod, Lit, Local, Meta, Pat, RevealHide, Stmt, Token, Type, UnOp, Visibility,
 };
 use walkdir::WalkDir;
 
@@ -133,6 +134,12 @@ struct VerusMacroVisitor<'a> {
 }
 
 impl<'ast> Visit<'ast> for VerusMacroVisitor<'_> {
+    fn visit_item_mod(&mut self, node: &'ast ItemMod) {
+        if !is_cfg_gated(&node.attrs) {
+            visit::visit_item_mod(self, node);
+        }
+    }
+
     fn visit_item_macro(&mut self, node: &'ast ItemMacro) {
         let is_verus = node
             .mac
@@ -276,7 +283,46 @@ impl ExecVisitor<'_> {
 }
 
 impl<'ast> Visit<'ast> for ExecVisitor<'_> {
+    fn visit_item_mod(&mut self, node: &'ast ItemMod) {
+        if !is_cfg_gated(&node.attrs) {
+            visit::visit_item_mod(self, node);
+        }
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
+        if !is_cfg_gated(&node.attrs) {
+            visit::visit_item_impl(self, node);
+        }
+    }
+
+    fn visit_local(&mut self, node: &'ast Local) {
+        // `let ghost` / `let tracked` bindings and `Ghost<T>` / `Tracked<T>`
+        // values are erased before execution: mutating them tests no
+        // executable behavior and is not a meaningful signal.
+        if node.ghost.is_some()
+            || node.tracked.is_some()
+            || is_ghost_pattern(&node.pat)
+            || node
+                .init
+                .as_ref()
+                .is_some_and(|init| is_ghost_wrapper(&init.expr))
+        {
+            return;
+        }
+        visit::visit_local(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        if is_ghost_wrapper(&Expr::Call(node.clone())) {
+            return;
+        }
+        visit::visit_expr_call(self, node);
+    }
+
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+        if is_cfg_gated(&node.attrs) {
+            return;
+        }
         if !(Self::in_exec(&node.sig.mode)
             || self.operators.mutate_spec_functions && Self::in_spec(&node.sig.mode))
             || self.excluded_functions.is_match(node.sig.ident.to_string())
@@ -303,6 +349,9 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
+        if is_cfg_gated(&node.attrs) {
+            return;
+        }
         if !(Self::in_exec(&node.sig.mode)
             || self.operators.mutate_spec_functions && Self::in_spec(&node.sig.mode))
             || self.excluded_functions.is_match(node.sig.ident.to_string())
@@ -424,12 +473,15 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
 
     fn visit_stmt(&mut self, node: &'ast Stmt) {
         if self.operators.statement_deletion {
-            if let Stmt::Expr(expression, _) = node {
+            // Only statements terminated by `;` are deleted: the replacement
+            // keeps the terminator so the result is again a statement. A tail
+            // expression carries the block's value and cannot become `()`.
+            if let Stmt::Expr(expression, Some(_)) = node {
                 if matches!(
                     expression,
                     Expr::Call(_) | Expr::MethodCall(_) | Expr::Assign(_)
                 ) {
-                    self.add(node.span(), "delete-executable-statement", "()".into());
+                    self.add(node.span(), "delete-executable-statement", "();".into());
                 }
             }
         }
@@ -439,8 +491,18 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
     fn visit_expr_struct(&mut self, node: &'ast ExprStruct) {
         if self.operators.struct_field_value_substitution && node.fields.len() > 1 {
             for (index, field) in node.fields.iter().enumerate() {
-                let replacement = &node.fields[(index + 1) % node.fields.len()].expr;
-                if let Some((start, end)) = byte_range(self.source, replacement.span()) {
+                let other = &node.fields[(index + 1) % node.fields.len()];
+                // Without type information a swap is only known to type-check
+                // when both values have a syntactically evident, equal type.
+                // Shorthand fields (`S { a, b }`) are skipped: the swapped
+                // text would name the same field twice.
+                if field.colon_token.is_none()
+                    || other.colon_token.is_none()
+                    || !evidently_same_type(&field.expr, &other.expr, self.source)
+                {
+                    continue;
+                }
+                if let Some((start, end)) = byte_range(self.source, other.expr.span()) {
                     self.add(
                         field.expr.span(),
                         "substitute-struct-field-value",
@@ -493,6 +555,96 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
     fn visit_reveal_hide(&mut self, _node: &'ast RevealHide) {}
 }
 
+/// True when two expressions have the same type by syntax alone: literals of
+/// one kind and suffix, or `as` casts to the same type.
+fn evidently_same_type(left: &Expr, right: &Expr, source: &str) -> bool {
+    fn literal_kind(expression: &Expr) -> Option<String> {
+        let Expr::Lit(literal) = expression else {
+            return None;
+        };
+        Some(match &literal.lit {
+            Lit::Int(value) => format!("int:{}", value.suffix()),
+            Lit::Float(value) => format!("float:{}", value.suffix()),
+            Lit::Bool(_) => "bool".into(),
+            Lit::Str(_) => "str".into(),
+            Lit::Char(_) => "char".into(),
+            _ => return None,
+        })
+    }
+    fn cast_type(expression: &Expr, source: &str) -> Option<String> {
+        let Expr::Cast(cast) = expression else {
+            return None;
+        };
+        let (start, end) = byte_range(source, cast.ty.span())?;
+        Some(source[start..end].split_whitespace().collect())
+    }
+    if let (Some(a), Some(b)) = (literal_kind(left), literal_kind(right)) {
+        return a == b;
+    }
+    matches!((cast_type(left, source), cast_type(right, source)), (Some(a), Some(b)) if a == b)
+}
+
+/// `Ghost(..)` and `Tracked(..)` constructor calls.
+fn is_ghost_wrapper(expression: &Expr) -> bool {
+    let Expr::Call(call) = expression else {
+        return false;
+    };
+    let Expr::Path(path) = &*call.func else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "Ghost" || segment.ident == "Tracked")
+}
+
+/// A `let x: Ghost<T>` or `let x: Tracked<T>` pattern.
+fn is_ghost_pattern(pattern: &Pat) -> bool {
+    let Pat::Type(typed) = pattern else {
+        return false;
+    };
+    let Type::Path(path) = &*typed.ty else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "Ghost" || segment.ident == "Tracked")
+}
+
+/// True when the item is compiled only under `cfg(test)` or a Cargo feature,
+/// so the default build never verifies it and a mutant there could only
+/// survive vacuously. `not(..)` is treated as ungated and `any(..)` is gated
+/// only when every alternative is.
+fn is_cfg_gated(attributes: &[verus_syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.path().is_ident("cfg")
+            && attribute
+                .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+                .is_ok_and(|args| args.iter().any(meta_requires_test_or_feature))
+    })
+}
+
+fn meta_requires_test_or_feature(meta: &Meta) -> bool {
+    match meta {
+        Meta::Path(path) => path.is_ident("test"),
+        Meta::NameValue(pair) => pair.path.is_ident("feature"),
+        Meta::List(list) => {
+            let nested = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated);
+            let Ok(nested) = nested else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                nested.iter().any(meta_requires_test_or_feature)
+            } else if list.path.is_ident("any") {
+                !nested.is_empty() && nested.iter().all(meta_requires_test_or_feature)
+            } else {
+                false
+            }
+        }
+    }
+}
+
 fn has_external_body(attributes: &[verus_syn::Attribute]) -> bool {
     attributes.iter().any(|attribute| {
         attribute
@@ -527,6 +679,7 @@ mod tests {
     use super::{build_globs, byte_offset, discover_file};
     use crate::cargo::WorkspacePackage;
     use crate::config::OperatorsConfig;
+    use crate::model::Mutant;
     use proc_macro2::LineColumn;
     use std::collections::BTreeSet;
     use std::fs;
@@ -659,5 +812,120 @@ fn check(x: i32) -> bool
         )
         .unwrap();
         assert!(excluded.is_empty());
+    }
+
+    /// Discovers mutants in one `verus!` source string with the given operators.
+    pub(super) fn discover_source(source: &str, operators: &OperatorsConfig) -> Vec<Mutant> {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("src")).unwrap();
+        fs::write(directory.path().join("src/lib.rs"), source).unwrap();
+        let package = WorkspacePackage {
+            name: "fixture".into(),
+            root: directory.path().to_path_buf(),
+            source_roots: vec![directory.path().join("src")],
+            is_verus: true,
+        };
+        let mut mutants = Vec::new();
+        discover_file(
+            directory.path(),
+            &package,
+            &PathBuf::from("src/lib.rs"),
+            operators,
+            &Default::default(),
+            &build_globs(&[]).unwrap(),
+            &mut mutants,
+        )
+        .unwrap();
+        mutants
+    }
+
+    /// The source text after applying one mutant.
+    pub(super) fn apply_to(source: &str, mutant: &Mutant) -> String {
+        format!(
+            "{}{}{}",
+            &source[..mutant.start],
+            mutant.replacement,
+            &source[mutant.end..]
+        )
+    }
+
+    #[test]
+    fn statement_deletion_keeps_the_terminator() {
+        let source = "verus! {\nfn f(v: &mut Vec<u8>) {\n    v.push(1);\n    v.push(2)\n}\n}\n";
+        let mutants = discover_source(source, &OperatorsConfig::default());
+        let deletions: Vec<_> = mutants
+            .iter()
+            .filter(|m| m.operator == "delete-executable-statement")
+            .collect();
+        // The tail expression `v.push(2)` has no `;` and is not deleted.
+        assert_eq!(deletions.len(), 1);
+        assert_eq!(deletions[0].replacement, "();");
+        let mutated = apply_to(source, deletions[0]);
+        let file: verus_syn::File = verus_syn::parse_file(&mutated).expect("mutant parses");
+        let _ = file;
+        assert!(mutated.contains("();\n    v.push(2)"));
+    }
+
+    #[test]
+    fn struct_field_substitution_requires_evidently_equal_types() {
+        let source = r#"verus! {
+struct P { a: u32, b: u32, c: bool, d: usize }
+fn f(x: u32, y: bool, n: u64) -> P {
+    let a = x;
+    let b = x;
+    let _shorthand = P { a, b, c: y, d: 0 };
+    let _lits = P { a: 1, b: 2, c: y, d: n as usize };
+    let _casts = P { a: n as u32, b: x as u32, c: y, d: 0 };
+    P { a: x, b: x, c: y, d: 1 }
+}
+}
+"#;
+        let mutants = discover_source(source, &OperatorsConfig::default());
+        let swaps: Vec<_> = mutants
+            .iter()
+            .filter(|m| m.operator == "substitute-struct-field-value")
+            .map(|m| (m.original.as_str(), m.replacement.as_str()))
+            .collect();
+        // Each field is swapped with its cyclic successor only: `a: 1` takes
+        // `b`'s `2` and `a: n as u32` takes `b`'s cast. Shorthand fields, `x`/`y`
+        // paths and bool-versus-int pairs are skipped.
+        assert_eq!(swaps.len(), 2, "{swaps:?}");
+        assert!(swaps.contains(&("1", "2")));
+        assert!(swaps.contains(&("n as u32", "x as u32")));
+    }
+
+    #[test]
+    fn ghost_values_and_gated_code_are_not_mutated() {
+        let source = r#"verus! {
+fn f(x: u32) -> u32 {
+    let ghost g = x + 1;
+    let tracked t = x + 2;
+    let h: Ghost<int> = Ghost(x + 3);
+    let k = Ghost(x + 4);
+    let real = x + 5;
+    real
+}
+#[cfg(test)]
+fn only_test(x: u32) -> u32 { x + 6 }
+#[cfg(feature = "extra")]
+fn only_feature(x: u32) -> u32 { x + 7 }
+#[cfg(not(feature = "extra"))]
+fn without_feature(x: u32) -> u32 { x + 8 }
+#[cfg(all(unix, feature = "extra"))]
+fn all_gated(x: u32) -> u32 { x + 9 }
+#[cfg(any(unix, feature = "extra"))]
+fn any_open(x: u32) -> u32 { x + 10 }
+#[cfg(test)]
+mod tests { fn inner(x: u32) -> u32 { x + 11 } }
+}
+"#;
+        let mutants = discover_source(source, &OperatorsConfig::default());
+        let touched: BTreeSet<_> = mutants
+            .iter()
+            .filter(|m| m.operator == "replace-integer-literal")
+            .map(|m| m.original.as_str())
+            .collect();
+        let expected: BTreeSet<_> = ["5", "8", "10"].into_iter().collect();
+        assert_eq!(touched, expected);
     }
 }
