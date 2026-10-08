@@ -130,7 +130,11 @@ The automatic campaign parses `verus!` bodies with `verus_syn`. By default it
 visits only default or `exec` function bodies. It does not mutate assertions,
 assumptions, quantifiers, proof closures, or loop proof clauses. Operators cover
 conditions, logical clauses, relational and arithmetic operators, literals,
-standalone effect statements, struct field values, and match-arm bodies.
+standalone effect statements (`;`-terminated calls and assignments), struct
+field values, and match-arm bodies. Struct-field substitution swaps a field's
+value with its successor's only when both are literals of one kind and suffix
+or casts to the same type, because the tool has no type information; shorthand
+fields are skipped.
 
 `mutate_contracts` and `mutate_spec_functions` enable a separate assurance
 hardening campaign. These mutations challenge whether the rest of the proof

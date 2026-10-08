@@ -442,8 +442,18 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
     fn visit_expr_struct(&mut self, node: &'ast ExprStruct) {
         if self.operators.struct_field_value_substitution && node.fields.len() > 1 {
             for (index, field) in node.fields.iter().enumerate() {
-                let replacement = &node.fields[(index + 1) % node.fields.len()].expr;
-                if let Some((start, end)) = byte_range(self.source, replacement.span()) {
+                let other = &node.fields[(index + 1) % node.fields.len()];
+                // Without type information a swap is only known to type-check
+                // when both values have a syntactically evident, equal type.
+                // Shorthand fields (`S { a, b }`) are skipped: the swapped
+                // text would name the same field twice.
+                if field.colon_token.is_none()
+                    || other.colon_token.is_none()
+                    || !evidently_same_type(&field.expr, &other.expr, self.source)
+                {
+                    continue;
+                }
+                if let Some((start, end)) = byte_range(self.source, other.expr.span()) {
                     self.add(
                         field.expr.span(),
                         "substitute-struct-field-value",
@@ -494,6 +504,35 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
     fn visit_assume(&mut self, _node: &'ast Assume) {}
 
     fn visit_reveal_hide(&mut self, _node: &'ast RevealHide) {}
+}
+
+/// True when two expressions have the same type by syntax alone: literals of
+/// one kind and suffix, or `as` casts to the same type.
+fn evidently_same_type(left: &Expr, right: &Expr, source: &str) -> bool {
+    fn literal_kind(expression: &Expr) -> Option<String> {
+        let Expr::Lit(literal) = expression else {
+            return None;
+        };
+        Some(match &literal.lit {
+            Lit::Int(value) => format!("int:{}", value.suffix()),
+            Lit::Float(value) => format!("float:{}", value.suffix()),
+            Lit::Bool(_) => "bool".into(),
+            Lit::Str(_) => "str".into(),
+            Lit::Char(_) => "char".into(),
+            _ => return None,
+        })
+    }
+    fn cast_type(expression: &Expr, source: &str) -> Option<String> {
+        let Expr::Cast(cast) = expression else {
+            return None;
+        };
+        let (start, end) = byte_range(source, cast.ty.span())?;
+        Some(source[start..end].split_whitespace().collect())
+    }
+    if let (Some(a), Some(b)) = (literal_kind(left), literal_kind(right)) {
+        return a == b;
+    }
+    matches!((cast_type(left, source), cast_type(right, source)), (Some(a), Some(b)) if a == b)
 }
 
 fn has_external_body(attributes: &[verus_syn::Attribute]) -> bool {
@@ -715,5 +754,33 @@ fn check(x: i32) -> bool
         let file: verus_syn::File = verus_syn::parse_file(&mutated).expect("mutant parses");
         let _ = file;
         assert!(mutated.contains("();\n    v.push(2)"));
+    }
+
+    #[test]
+    fn struct_field_substitution_requires_evidently_equal_types() {
+        let source = r#"verus! {
+struct P { a: u32, b: u32, c: bool, d: usize }
+fn f(x: u32, y: bool, n: u64) -> P {
+    let a = x;
+    let b = x;
+    let _shorthand = P { a, b, c: y, d: 0 };
+    let _lits = P { a: 1, b: 2, c: y, d: n as usize };
+    let _casts = P { a: n as u32, b: x as u32, c: y, d: 0 };
+    P { a: x, b: x, c: y, d: 1 }
+}
+}
+"#;
+        let mutants = discover_source(source, &OperatorsConfig::default());
+        let swaps: Vec<_> = mutants
+            .iter()
+            .filter(|m| m.operator == "substitute-struct-field-value")
+            .map(|m| (m.original.as_str(), m.replacement.as_str()))
+            .collect();
+        // Each field is swapped with its cyclic successor only: `a: 1` takes
+        // `b`'s `2` and `a: n as u32` takes `b`'s cast. Shorthand fields, `x`/`y`
+        // paths and bool-versus-int pairs are skipped.
+        assert_eq!(swaps.len(), 2, "{swaps:?}");
+        assert!(swaps.contains(&("1", "2")));
+        assert!(swaps.contains(&("n as u32", "x as u32")));
     }
 }
