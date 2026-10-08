@@ -424,12 +424,15 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
 
     fn visit_stmt(&mut self, node: &'ast Stmt) {
         if self.operators.statement_deletion {
-            if let Stmt::Expr(expression, _) = node {
+            // Only statements terminated by `;` are deleted: the replacement
+            // keeps the terminator so the result is again a statement. A tail
+            // expression carries the block's value and cannot become `()`.
+            if let Stmt::Expr(expression, Some(_)) = node {
                 if matches!(
                     expression,
                     Expr::Call(_) | Expr::MethodCall(_) | Expr::Assign(_)
                 ) {
-                    self.add(node.span(), "delete-executable-statement", "()".into());
+                    self.add(node.span(), "delete-executable-statement", "();".into());
                 }
             }
         }
@@ -527,6 +530,7 @@ mod tests {
     use super::{build_globs, byte_offset, discover_file};
     use crate::cargo::WorkspacePackage;
     use crate::config::OperatorsConfig;
+    use crate::model::Mutant;
     use proc_macro2::LineColumn;
     use std::collections::BTreeSet;
     use std::fs;
@@ -659,5 +663,57 @@ fn check(x: i32) -> bool
         )
         .unwrap();
         assert!(excluded.is_empty());
+    }
+
+    /// Discovers mutants in one `verus!` source string with the given operators.
+    pub(super) fn discover_source(source: &str, operators: &OperatorsConfig) -> Vec<Mutant> {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("src")).unwrap();
+        fs::write(directory.path().join("src/lib.rs"), source).unwrap();
+        let package = WorkspacePackage {
+            name: "fixture".into(),
+            root: directory.path().to_path_buf(),
+            source_roots: vec![directory.path().join("src")],
+            is_verus: true,
+        };
+        let mut mutants = Vec::new();
+        discover_file(
+            directory.path(),
+            &package,
+            &PathBuf::from("src/lib.rs"),
+            operators,
+            &Default::default(),
+            &build_globs(&[]).unwrap(),
+            &mut mutants,
+        )
+        .unwrap();
+        mutants
+    }
+
+    /// The source text after applying one mutant.
+    pub(super) fn apply_to(source: &str, mutant: &Mutant) -> String {
+        format!(
+            "{}{}{}",
+            &source[..mutant.start],
+            mutant.replacement,
+            &source[mutant.end..]
+        )
+    }
+
+    #[test]
+    fn statement_deletion_keeps_the_terminator() {
+        let source = "verus! {\nfn f(v: &mut Vec<u8>) {\n    v.push(1);\n    v.push(2)\n}\n}\n";
+        let mutants = discover_source(source, &OperatorsConfig::default());
+        let deletions: Vec<_> = mutants
+            .iter()
+            .filter(|m| m.operator == "delete-executable-statement")
+            .collect();
+        // The tail expression `v.push(2)` has no `;` and is not deleted.
+        assert_eq!(deletions.len(), 1);
+        assert_eq!(deletions[0].replacement, "();");
+        let mutated = apply_to(source, deletions[0]);
+        let file: verus_syn::File = verus_syn::parse_file(&mutated).expect("mutant parses");
+        let _ = file;
+        assert!(mutated.contains("();\n    v.push(2)"));
     }
 }
