@@ -436,20 +436,38 @@ fn baseline_commands(
         return Ok(commands);
     }
     commands.retain(|_, baseline| baseline.kind != crate::model::OracleKind::Verus);
-    let encoded = serde_json::to_vec(&(
-        &verification.baseline_command,
-        &crate::model::OracleKind::Verus,
-        Option::<usize>::None,
-    ))?;
-    let key = hex::encode(Sha256::digest(encoded));
-    commands.insert(
-        key[..12].to_string(),
-        Baseline {
-            command: verification.baseline_command.clone(),
+    // `{package}` in the baseline command expands to each package that has a
+    // Verus mutant, so a per-package baseline verifies exactly what the
+    // mutants will.
+    let packages: BTreeSet<&str> = mutants
+        .iter()
+        .filter(|mutant| mutant.oracle.kind == crate::model::OracleKind::Verus)
+        .map(|mutant| {
+            mutant
+                .oracle
+                .package
+                .as_deref()
+                .unwrap_or(mutant.package.as_str())
+        })
+        .collect();
+    for package in packages {
+        let command: Vec<String> = verification
+            .baseline_command
+            .iter()
+            .map(|part| part.replace("{package}", package))
+            .collect();
+        let encoded = serde_json::to_vec(&(
+            &command,
+            &crate::model::OracleKind::Verus,
+            Option::<usize>::None,
+        ))?;
+        let key = hex::encode(Sha256::digest(encoded));
+        commands.entry(key[..12].to_string()).or_insert(Baseline {
+            command,
             kind: crate::model::OracleKind::Verus,
             required_test_count: None,
-        },
-    );
+        });
+    }
     Ok(commands)
 }
 
@@ -503,6 +521,21 @@ mod tests {
         )
         .unwrap();
         project
+    }
+
+    #[test]
+    fn baseline_command_expands_package_per_mutant_package() {
+        let project = project();
+        let loaded = config::load(project.path()).unwrap();
+        let mutants = discover_all(&loaded, false, false).unwrap();
+        let verification = config::VerificationConfig {
+            baseline_command: vec!["verify".into(), "-p".into(), "{package}".into()],
+            ..config::VerificationConfig::default()
+        };
+        let commands = super::baseline_commands(&mutants, &verification).unwrap();
+        assert_eq!(commands.len(), 1);
+        let baseline = commands.values().next().unwrap();
+        assert_eq!(baseline.command, ["verify", "-p", "fixture"]);
     }
 
     #[test]
