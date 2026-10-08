@@ -6,12 +6,13 @@ use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use proc_macro2::{LineColumn, Span};
 use sha2::{Digest, Sha256};
+use verus_syn::punctuated::Punctuated;
 use verus_syn::spanned::Spanned;
 use verus_syn::visit::{self, Visit};
 use verus_syn::{
-    Assert, AssertForall, Assume, BinOp, Expr, ExprBinary, ExprClosure, ExprIf, ExprLit, ExprMatch,
-    ExprStruct, ExprUnary, ExprWhile, FnMode, ImplItemFn, ItemFn, ItemMacro, Lit, RevealHide, Stmt,
-    UnOp, Visibility,
+    Assert, AssertForall, Assume, BinOp, Expr, ExprBinary, ExprCall, ExprClosure, ExprIf, ExprLit,
+    ExprMatch, ExprStruct, ExprUnary, ExprWhile, FnMode, ImplItemFn, ItemFn, ItemImpl, ItemMacro,
+    ItemMod, Lit, Local, Meta, Pat, RevealHide, Stmt, Token, Type, UnOp, Visibility,
 };
 use walkdir::WalkDir;
 
@@ -133,6 +134,12 @@ struct VerusMacroVisitor<'a> {
 }
 
 impl<'ast> Visit<'ast> for VerusMacroVisitor<'_> {
+    fn visit_item_mod(&mut self, node: &'ast ItemMod) {
+        if !is_cfg_gated(&node.attrs) {
+            visit::visit_item_mod(self, node);
+        }
+    }
+
     fn visit_item_macro(&mut self, node: &'ast ItemMacro) {
         let is_verus = node
             .mac
@@ -276,7 +283,46 @@ impl ExecVisitor<'_> {
 }
 
 impl<'ast> Visit<'ast> for ExecVisitor<'_> {
+    fn visit_item_mod(&mut self, node: &'ast ItemMod) {
+        if !is_cfg_gated(&node.attrs) {
+            visit::visit_item_mod(self, node);
+        }
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
+        if !is_cfg_gated(&node.attrs) {
+            visit::visit_item_impl(self, node);
+        }
+    }
+
+    fn visit_local(&mut self, node: &'ast Local) {
+        // `let ghost` / `let tracked` bindings and `Ghost<T>` / `Tracked<T>`
+        // values are erased before execution: mutating them tests no
+        // executable behavior and is not a meaningful signal.
+        if node.ghost.is_some()
+            || node.tracked.is_some()
+            || is_ghost_pattern(&node.pat)
+            || node
+                .init
+                .as_ref()
+                .is_some_and(|init| is_ghost_wrapper(&init.expr))
+        {
+            return;
+        }
+        visit::visit_local(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        if is_ghost_wrapper(&Expr::Call(node.clone())) {
+            return;
+        }
+        visit::visit_expr_call(self, node);
+    }
+
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+        if is_cfg_gated(&node.attrs) {
+            return;
+        }
         if !(Self::in_exec(&node.sig.mode)
             || self.operators.mutate_spec_functions && Self::in_spec(&node.sig.mode))
             || self.excluded_functions.is_match(node.sig.ident.to_string())
@@ -303,6 +349,9 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
+        if is_cfg_gated(&node.attrs) {
+            return;
+        }
         if !(Self::in_exec(&node.sig.mode)
             || self.operators.mutate_spec_functions && Self::in_spec(&node.sig.mode))
             || self.excluded_functions.is_match(node.sig.ident.to_string())
@@ -533,6 +582,67 @@ fn evidently_same_type(left: &Expr, right: &Expr, source: &str) -> bool {
         return a == b;
     }
     matches!((cast_type(left, source), cast_type(right, source)), (Some(a), Some(b)) if a == b)
+}
+
+/// `Ghost(..)` and `Tracked(..)` constructor calls.
+fn is_ghost_wrapper(expression: &Expr) -> bool {
+    let Expr::Call(call) = expression else {
+        return false;
+    };
+    let Expr::Path(path) = &*call.func else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "Ghost" || segment.ident == "Tracked")
+}
+
+/// A `let x: Ghost<T>` or `let x: Tracked<T>` pattern.
+fn is_ghost_pattern(pattern: &Pat) -> bool {
+    let Pat::Type(typed) = pattern else {
+        return false;
+    };
+    let Type::Path(path) = &*typed.ty else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "Ghost" || segment.ident == "Tracked")
+}
+
+/// True when the item is compiled only under `cfg(test)` or a Cargo feature,
+/// so the default build never verifies it and a mutant there could only
+/// survive vacuously. `not(..)` is treated as ungated and `any(..)` is gated
+/// only when every alternative is.
+fn is_cfg_gated(attributes: &[verus_syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.path().is_ident("cfg")
+            && attribute
+                .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+                .is_ok_and(|args| args.iter().any(meta_requires_test_or_feature))
+    })
+}
+
+fn meta_requires_test_or_feature(meta: &Meta) -> bool {
+    match meta {
+        Meta::Path(path) => path.is_ident("test"),
+        Meta::NameValue(pair) => pair.path.is_ident("feature"),
+        Meta::List(list) => {
+            let nested = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated);
+            let Ok(nested) = nested else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                nested.iter().any(meta_requires_test_or_feature)
+            } else if list.path.is_ident("any") {
+                !nested.is_empty() && nested.iter().all(meta_requires_test_or_feature)
+            } else {
+                false
+            }
+        }
+    }
 }
 
 fn has_external_body(attributes: &[verus_syn::Attribute]) -> bool {
@@ -782,5 +892,40 @@ fn f(x: u32, y: bool, n: u64) -> P {
         assert_eq!(swaps.len(), 2, "{swaps:?}");
         assert!(swaps.contains(&("1", "2")));
         assert!(swaps.contains(&("n as u32", "x as u32")));
+    }
+
+    #[test]
+    fn ghost_values_and_gated_code_are_not_mutated() {
+        let source = r#"verus! {
+fn f(x: u32) -> u32 {
+    let ghost g = x + 1;
+    let tracked t = x + 2;
+    let h: Ghost<int> = Ghost(x + 3);
+    let k = Ghost(x + 4);
+    let real = x + 5;
+    real
+}
+#[cfg(test)]
+fn only_test(x: u32) -> u32 { x + 6 }
+#[cfg(feature = "extra")]
+fn only_feature(x: u32) -> u32 { x + 7 }
+#[cfg(not(feature = "extra"))]
+fn without_feature(x: u32) -> u32 { x + 8 }
+#[cfg(all(unix, feature = "extra"))]
+fn all_gated(x: u32) -> u32 { x + 9 }
+#[cfg(any(unix, feature = "extra"))]
+fn any_open(x: u32) -> u32 { x + 10 }
+#[cfg(test)]
+mod tests { fn inner(x: u32) -> u32 { x + 11 } }
+}
+"#;
+        let mutants = discover_source(source, &OperatorsConfig::default());
+        let touched: BTreeSet<_> = mutants
+            .iter()
+            .filter(|m| m.operator == "replace-integer-literal")
+            .map(|m| m.original.as_str())
+            .collect();
+        let expected: BTreeSet<_> = ["5", "8", "10"].into_iter().collect();
+        assert_eq!(touched, expected);
     }
 }

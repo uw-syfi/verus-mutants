@@ -126,6 +126,13 @@ Verus. A nonstandard test or command oracle can set `kind`, `command`,
 
 ## Mutation and oracle semantics
 
+Ghost code is never mutated: `let ghost`, `let tracked`, `Ghost<T>` and
+`Tracked<T>` bindings, `Ghost(..)` and `Tracked(..)` calls, `proof` blocks, and
+spec and proof functions (the last two only when `mutate_spec_functions` is
+off). Items gated by `#[cfg(test)]` or `#[cfg(feature = "...")]`
+(including `all(..)` containing one, or an `any(..)` whose alternatives are all
+gated) are skipped, since the default build does not verify them.
+
 The automatic campaign parses `verus!` bodies with `verus_syn`. By default it
 visits only default or `exec` function bodies. It does not mutate assertions,
 assumptions, quantifiers, proof closures, or loop proof clauses. Operators cover
