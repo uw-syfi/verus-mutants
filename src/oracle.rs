@@ -231,6 +231,25 @@ struct RawExecution {
     output: String,
 }
 
+/// Expands `{source}` and `{target}`, the worker's isolated source tree and
+/// Cargo target directory, when the command runs. A container command mounts
+/// them at the same paths, for example `-v {source}:{source} -w {source}`.
+fn bind_paths(
+    command: &[String],
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> Vec<String> {
+    let source = source.display().to_string();
+    let target = target.display().to_string();
+    command
+        .iter()
+        .map(|part| {
+            part.replace("{source}", &source)
+                .replace("{target}", &target)
+        })
+        .collect()
+}
+
 fn run_process(
     source: &std::path::Path,
     target: &std::path::Path,
@@ -243,6 +262,7 @@ fn run_process(
     let stdout = File::create(&output_path)?;
     let stderr = stdout.try_clone()?;
     let started = Instant::now();
+    let command = bind_paths(command, source, target);
     let finished = crate::process::run_with_timeout(
         Command::new(&command[0])
             .args(&command[1..])
@@ -473,7 +493,9 @@ fn tail(text: &str, bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, expand, has_positive_verification, kill_location, passed_test_count};
+    use super::{
+        bind_paths, classify, expand, has_positive_verification, kill_location, passed_test_count,
+    };
     use crate::model::{Campaign, Mutant, OracleKind, OracleSpec, Outcome};
     use std::path::PathBuf;
 
@@ -554,6 +576,22 @@ mod tests {
             "error[E0425]: cannot find value `g` in this scope",
         );
         assert_eq!(result.0, Outcome::Invalid);
+    }
+
+    #[test]
+    fn source_and_target_placeholders_bind_to_the_worker_sandbox() {
+        let template: Vec<String> = ["docker", "-v", "{source}:{source}", "-e", "T={target}"]
+            .map(String::from)
+            .to_vec();
+        let bound = bind_paths(
+            &template,
+            std::path::Path::new("/w/source"),
+            std::path::Path::new("/w/target"),
+        );
+        assert_eq!(
+            bound,
+            ["docker", "-v", "/w/source:/w/source", "-e", "T=/w/target"]
+        );
     }
 
     #[test]
