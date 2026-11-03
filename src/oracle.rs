@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tempfile::TempDir;
-use wait_timeout::ChildExt;
 
 use crate::config::VerificationConfig;
 use crate::model::{KillLocation, Mutant, OracleKind, Outcome};
@@ -244,24 +243,20 @@ fn run_process(
     let stdout = File::create(&output_path)?;
     let stderr = stdout.try_clone()?;
     let started = Instant::now();
-    let mut child = Command::new(&command[0])
-        .args(&command[1..])
-        .current_dir(source)
-        .env("CARGO_TARGET_DIR", target)
-        .env("CARGO_TERM_COLOR", "never")
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .with_context(|| format!("spawning {}", command.join(" ")))?;
-    let timeout = Duration::from_secs(timeout_seconds);
-    let status = child.wait_timeout(timeout)?;
-    let (returncode, timed_out) = match status {
+    let finished = crate::process::run_with_timeout(
+        Command::new(&command[0])
+            .args(&command[1..])
+            .current_dir(source)
+            .env("CARGO_TARGET_DIR", target)
+            .env("CARGO_TERM_COLOR", "never")
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr)),
+        Duration::from_secs(timeout_seconds),
+    )
+    .with_context(|| format!("spawning {}", command.join(" ")))?;
+    let (returncode, timed_out) = match finished.status {
         Some(status) => (status.code(), false),
-        None => {
-            child.kill().ok();
-            let status = child.wait()?;
-            (status.code(), true)
-        }
+        None => (None, true),
     };
     let output = fs::read_to_string(output_path)?;
     Ok(RawExecution {

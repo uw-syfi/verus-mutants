@@ -20,6 +20,7 @@ path = "src/main.rs"
 anyhow = "1"
 cargo_metadata = "0.19"
 clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3", features = ["termination"] }
 hex = "0.4"
 globset = "0.4"
 proc-macro2 = { version = "1", features = ["span-locations"] }
@@ -31,6 +32,9 @@ toml = "0.8"
 walkdir = "2"
 wait-timeout = "0.2"
 verus_syn = { version = "=0.0.0-2026-08-02-0125", features = ["full", "visit", "extra-traits"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 pretty_assertions = "1"

@@ -5,6 +5,7 @@ mod discover;
 mod materialize;
 mod model;
 mod oracle;
+mod process;
 mod report;
 mod runner;
 mod rust;
