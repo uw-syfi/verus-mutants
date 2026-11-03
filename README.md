@@ -158,6 +158,9 @@ exclude_functions = ["ffi_*", "trusted_boundary"]
 command = ["cargo", "verus", "build", "-p", "{package}"]
 baseline_command = ["cargo", "verus", "build", "--workspace"]
 timeout_seconds = 240
+# Optional: a worker's clean baseline builds its dependencies cold, so it may
+# need longer than one mutant (default: timeout_seconds).
+baseline_timeout_seconds = 900
 
 # Command placeholders (verification.command, baseline_command and command
 # oracles): {package}; {module}, the Verus module path of the mutated file

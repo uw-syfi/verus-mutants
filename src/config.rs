@@ -49,6 +49,18 @@ pub struct VerificationConfig {
     /// live in other modules. Defaults to `baseline_command`, then `command`.
     pub redundancy_command: Vec<String>,
     pub timeout_seconds: u64,
+    /// Wall-clock limit for a worker's clean baseline, which builds the
+    /// worker's dependencies cold and so can take much longer than one
+    /// mutant. Defaults to `timeout_seconds`.
+    pub baseline_timeout_seconds: Option<u64>,
+}
+
+impl VerificationConfig {
+    /// The limit for a clean baseline.
+    pub fn baseline_timeout(&self) -> u64 {
+        self.baseline_timeout_seconds
+            .unwrap_or(self.timeout_seconds)
+    }
 }
 
 impl Default for VerificationConfig {
@@ -64,6 +76,7 @@ impl Default for VerificationConfig {
             baseline_command: Vec::new(),
             redundancy_command: Vec::new(),
             timeout_seconds: 240,
+            baseline_timeout_seconds: None,
         }
     }
 }
@@ -295,8 +308,19 @@ fn infer_package<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::load;
+    use super::{load, VerificationConfig};
     use std::fs;
+
+    #[test]
+    fn the_baseline_timeout_defaults_to_the_mutant_timeout() {
+        let parse = |text: &str| toml::from_str::<VerificationConfig>(text).unwrap();
+        assert_eq!(parse("timeout_seconds = 60\n").baseline_timeout(), 60);
+        assert_eq!(
+            parse("timeout_seconds = 60\nbaseline_timeout_seconds = 900\n").baseline_timeout(),
+            900
+        );
+        assert_eq!(parse("").baseline_timeout(), 240);
+    }
 
     #[test]
     fn member_directory_resolves_workspace_configuration_root() {

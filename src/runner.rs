@@ -341,7 +341,7 @@ fn execute_worker(
             &source,
             &target,
             command,
-            verification.timeout_seconds,
+            verification.baseline_timeout(),
             &baseline.kind,
             baseline.required_test_count,
             &log_root.join(format!("baseline-worker-{worker}-{key}.log")),
@@ -673,6 +673,46 @@ mod tests {
         assert_eq!(commands.len(), 1);
         let baseline = commands.values().next().unwrap();
         assert_eq!(baseline.command, ["verify", "-p", "fixture"]);
+    }
+
+    #[test]
+    fn a_slow_baseline_gets_the_baseline_timeout_not_the_mutant_timeout() {
+        let project = project();
+        fs::create_dir_all(project.path().join("target/verus-mutants/logs")).unwrap();
+        let loaded = config::load(project.path()).unwrap();
+        let mut mutants = discover_all(&loaded, false, false).unwrap();
+        mutants.truncate(1);
+        let sh = |script: &str| vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()];
+        let mut verification = config::VerificationConfig {
+            // The baseline outlasts the mutant limit; each mutant fails at once.
+            baseline_command: sh("sleep 2; echo 'verification results:: 1 verified, 0 errors'"),
+            command: sh("echo 'error: assertion failed'; exit 1"),
+            timeout_seconds: 1,
+            baseline_timeout_seconds: Some(60),
+            ..config::VerificationConfig::default()
+        };
+        let results = super::execute_worker(
+            0,
+            project.path(),
+            mutants.clone(),
+            &verification,
+            &Default::default(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1);
+
+        verification.baseline_timeout_seconds = None;
+        let err = super::execute_worker(
+            0,
+            project.path(),
+            mutants,
+            &verification,
+            &Default::default(),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("baseline timed out"), "{err}");
     }
 
     #[test]

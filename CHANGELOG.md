@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.2
+
+- `[verification] baseline_timeout_seconds` sets a separate wall-clock limit
+  for a worker's clean baseline, which builds the worker's dependencies cold
+  and can take far longer than one mutant. It defaults to `timeout_seconds`,
+  the previous behavior.
+
 ## 0.3.1
 
 - A failing or timed-out baseline now writes its whole output to
