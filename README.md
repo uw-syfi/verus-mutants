@@ -15,6 +15,19 @@ The tool resolves the workspace, finds Verus packages from existing Cargo
 metadata or `verus!` source, and verifies each package with
 `cargo verus build -p {package}`. `.verus-mutants.toml` is optional.
 
+## Supported Verus releases
+
+| Verus release | Source parser | Output adapter |
+| --- | --- | --- |
+| 0.2026.07.18.3a4d30b | `verus_syn` 0.0.0-2026-08-02-0125 | `adapters::v2026` |
+| 0.2026.08.30.b432e82 | `verus_syn` 0.0.0-2026-08-02-0125 | `adapters::v2026` |
+
+`cargo verus-mutants --version` prints the same list. Both releases are
+covered by the Verus end-to-end tests (see Development). Verus syntax only
+grows, so one `verus_syn` release parses every supported release. Verus
+output carries no release number, so every supported output adapter's
+patterns are accepted; see "Adding a Verus release" below.
+
 ## Install and use
 
 ```sh
@@ -55,16 +68,83 @@ src/cargo.rs        Cargo metadata and verified-package discovery
 src/config.rs       .verus-mutants.toml schema
 src/discover.rs     Verus parsing and automatic operators
 src/materialize.rs  isolated copies and guarded source edits
-src/oracle.rs       process execution and result classification
+src/oracle.rs       oracle commands and result classification
+src/adapters/       Verus output knowledge, one adapter per output generation
+src/process.rs      process groups, timeouts and interrupts
 src/runner.rs       baselines, selection, and campaign orchestration
 src/report.rs       terminal and JSON reports
 ```
 
-The redundancy end-to-end test (`tests/redundancy_e2e.rs`) needs Verus: see its
-header comment.
+`strata.toml` states the module layering (for example: only `oracle`
+consults the adapters, only through `adapters`; adapters never reference each
+other; only `discover.rs` uses `verus_syn`; only `process.rs` waits on child
+processes). `cargo strata check` enforces it in CI.
 
 Projects use `.verus-mutants.toml` only for overrides or curated domain
 mutants.
+
+## Verifying in a container
+
+Verus often runs in a container image (its release binaries need a recent
+glibc, and a pinned image keeps the toolchain reproducible). The verification
+command can be any program, so a `docker run` works directly. Each worker
+runs the command in its isolated copy of the workspace (`{source}`) with its
+own Cargo target directory (`{target}`); mount both at the same paths so the
+paths in Verus diagnostics are the paths the tool knows:
+
+```toml
+[verification]
+command = [
+  "docker", "run", "--rm", "--init", "--user", "1000:1000",
+  "-v", "{source}:{source}", "-v", "{target}:{target}", "-w", "{source}",
+  "-e", "CARGO_TARGET_DIR={target}", "-e", "HOME=/tmp",
+  "-e", "CARGO_HOME=/cargo", "-v", "/path/to/cargo-cache:/cargo",
+  "my-verus-image:tag", "cargo", "verus", "build", "-p", "{package}",
+]
+timeout_seconds = 600
+```
+
+Or keep the container details in a script in the repository; it is copied
+into each worker's tree and runs there:
+
+```sh
+#!/bin/sh
+# verify: run "$@" in the Verus image, current directory and target mounted.
+exec docker run --rm --init --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -e CARGO_HOME=/cargo -v "$HOME/.cache/verus-cargo:/cargo" \
+  -v "$PWD:$PWD" -w "$PWD" \
+  -e CARGO_TARGET_DIR -v "$CARGO_TARGET_DIR:$CARGO_TARGET_DIR" \
+  my-verus-image:tag "$@"
+```
+
+```toml
+[verification]
+command = ["./verify", "cargo", "verus", "build", "-p", "{package}"]
+```
+
+Notes:
+
+- `--init` matters. On a timeout the tool sends `SIGTERM` to the command's
+  whole process group, which `docker run` forwards to the container, and
+  `SIGKILL` 10 seconds later. Without an init process, the container's first
+  process ignores `SIGTERM`, the container outlives the `docker` client, and
+  it keeps writing into the worker's target directory. Processes a command
+  leaves running in its group after it exits are stopped too, and Ctrl-C
+  stops every running command.
+- A host directory the user owns (a named volume is owned by root) as
+  `CARGO_HOME` keeps the downloaded `vstd` between runs. Each worker's first build compiles and verifies the
+  dependencies once; later mutants rebuild only the mutated package.
+- Worker trees live in the system temporary directory; set `TMPDIR` to put
+  them elsewhere (for example on a file system the container host shares).
+- The image needs `cargo verus` and the Rust toolchain that Verus release
+  wants. The crates need `vstd` (and `verus_builtin` and
+  `verus_builtin_macros` if they use macros such as
+  `try_open_atomic_update!` that expand to them) at the image's Verus
+  release, plus `[package.metadata.verus] verify = true`.
+
+Workspaces that are not Cargo packages can still use the tool through a
+script that builds them its own way: discovery needs the Cargo workspace to
+find packages and sources, and the command decides how to verify.
 
 ## Configuration
 
@@ -82,7 +162,9 @@ timeout_seconds = 240
 # Command placeholders (verification.command, baseline_command and command
 # oracles): {package}; {module}, the Verus module path of the mutated file
 # below src/ (a/b.rs gives a::b, lib.rs gives the crate name); {function}, the
-# mutated function; {worker}, the zero-based --jobs worker index. For example
+# mutated function; {worker}, the zero-based --jobs worker index; {source} and
+# {target}, the worker's isolated source tree (the command's working
+# directory) and Cargo target directory (also in CARGO_TARGET_DIR). For example
 #   command = ["env", "TARGET_VOL=vol-{worker}", "./verify", "cargo", "verus",
 #              "build", "-p", "{package}", "--", "--verify-module", "{module}"]
 
@@ -144,14 +226,21 @@ off). Items gated by `#[cfg(test)]` or `#[cfg(feature = "...")]`
 gated) are skipped, since the default build does not verify them.
 
 The automatic campaign parses `verus!` bodies with `verus_syn`. By default it
-visits only default or `exec` function bodies. It does not mutate assertions,
+visits only default or `exec` function bodies, including the blocks of
+`open_atomic_invariant!` and `open_local_invariant!`, which are exec code
+(usually an object's atomic linearization point). Other macro bodies,
+including `open_atomic_invariant_in_proof!` and the atomic-update macros, are
+not mutated, nor are the `atomically` specifications of logically atomic
+functions. It does not mutate assertions,
 assumptions, quantifiers, proof closures, or loop proof clauses. Operators cover
 conditions, logical clauses, relational and arithmetic operators, literals,
 standalone effect statements (`;`-terminated calls and assignments), struct
 field values, and match-arm bodies. Struct-field substitution swaps a field's
 value with its successor's only when both are literals of one kind and suffix
 or casts to the same type, because the tool has no type information; shorthand
-fields are skipped.
+fields are skipped. Match-arm substitution moves each arm's body into the
+previous arm, unless the body names a binding of its own pattern that the
+receiving pattern does not bind.
 
 `mutate_contracts` and `mutate_spec_functions` enable a separate assurance
 hardening campaign. These mutations challenge whether the rest of the proof
@@ -286,7 +375,12 @@ Results have distinct meanings:
 Each killed-by-proof result in `summary.json` carries a `kill` object with the
 failed obligation's `kind`, `file`, `line`, `column`, and `from_ensures` (true
 when the error is at a postcondition rather than an in-body assert, invariant,
-call precondition, or arithmetic check). The terminal report counts both.
+call precondition, or arithmetic check). The kinds are `postcondition`,
+`precondition`, `invariant` (loop invariants and invariant blocks), `atomic`,
+`assertion`, `decreases`, `division`, `arithmetic`, `bounds`, `unwind`
+and `type-invariant`. A failure Verus counts in its summary line under a
+diagnostic the tool does not know is still a kill, without a `kill` object.
+The terminal report counts both.
 
 Invalid mutants and timeouts are not kills. A clean Verus baseline must report
 at least one verified function and zero errors. A focused test baseline must
@@ -296,7 +390,7 @@ pass at least `required_test_count` tests, or one test by default.
 
 This is source-aware, not compiler-native. `verus_syn` can identify syntactic
 exec regions, but only Verus can resolve all expression modes and types. The
-runner therefore filters invalid mutants after generation. Campaigns are
+runner therefore filters invalid mutants after generation. Each worker is
 sequential and reuse one isolated incremental target. Use package filters,
 operator filters, mutant IDs, and deterministic limits for development runs.
 
@@ -311,7 +405,36 @@ report schema can remain the external interface for that implementation.
 cargo fmt --all -- --check
 cargo test
 cargo clippy --all-targets -- -D warnings
+cargo install cargo-strata --version 0.4.0 --locked
+cargo strata check
 ```
+
+The end-to-end tests (`tests/*_e2e.rs`) run real Verus and are ignored by
+default. Run them once per supported release, with an executable that runs
+`cargo verus build "$@"` (for example the `verify` script above with `cargo
+verus build` appended):
+
+```sh
+VERUS_FIXTURE_VERIFY=./verify-0.2026.07.18 cargo test -- --ignored
+VERUS_FIXTURE_VERIFY=./verify-0.2026.08.30 \
+  VERUS_FIXTURE_VSTD='"=0.0.0-2026-08-30-0159"' cargo test -- --ignored
+```
+
+The fixtures depend on the oldest supported release's `vstd`;
+`VERUS_FIXTURE_VSTD` replaces that dependency for another release.
+
+### Adding a Verus release
+
+1. Run the end-to-end tests against it (above). If they pass and
+   `cargo verus-mutants list` reports no parse warnings on real code, add the
+   release to `adapters::SUPPORTED` and the table at the top.
+2. If its syntax needs a newer parser, raise `verus_syn` to the release that
+   ships with it (the `dependencies/syn` version in Verus at that commit; it is
+   published on crates.io) and check that the older releases' fixtures still
+   parse.
+3. If its diagnostics or summary lines change, add an adapter beside
+   `adapters/v2026.rs` for the new patterns and consult it from the functions
+   in `adapters/mod.rs`. Keep the old adapter for the older releases.
 
 Licensed under either the Apache License, Version 2.0 or the MIT License, at
 your option.
