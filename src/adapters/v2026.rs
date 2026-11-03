@@ -6,41 +6,46 @@
 use crate::model::KillLocation;
 
 /// Verus diagnostics that report a failed proof obligation in a well-typed
-/// program. Order matters only for the reported label.
-const PROOF_DIAGNOSTICS: &[&str] = &[
-    "postcondition not satisfied",
-    "precondition not satisfied",
-    "requires not satisfied",
-    "invariant not satisfied",
-    "assertion failed",
-    "decreases not satisfied",
-    "possible division by zero",
-    "possible arithmetic underflow/overflow",
-    "possible bit shift underflow/overflow",
-    "possible array index out of bounds",
-    "constructed value may fail to meet its declared type invariant",
+/// program, with the kind label each reports. A diagnostic matches when its
+/// message contains the pattern; the first match gives the label. The texts
+/// are from Verus's `vir` crate (`def.rs`, `ast_to_sst.rs`, `sst_to_air.rs`).
+const PROOF_DIAGNOSTICS: &[(&str, &str)] = &[
+    ("postcondition not satisfied", "postcondition"),
+    ("precondition not satisfied", "precondition"),
+    ("requires not satisfied", "precondition"),
+    // Loop invariants ("invariant not satisfied before loop", "loop invariant
+    // not satisfied").
+    ("invariant not satisfied", "invariant"),
+    // The invariant of an `open_atomic_invariant!` or
+    // `open_local_invariant!` block.
+    ("Cannot show invariant holds at end of block", "invariant"),
+    // Logically atomic functions: "cannot show the atomic update was
+    // committed", "cannot show atomic postcondition hold at end of block".
+    ("cannot show the atomic update", "atomic"),
+    ("cannot show atomic", "atomic"),
+    ("assertion failed", "assertion"),
+    ("assertion failure", "assertion"),
+    ("decreases not satisfied", "decreases"),
+    ("possible division by zero", "division"),
+    ("possible arithmetic underflow/overflow", "arithmetic"),
+    ("possible bit shift underflow/overflow", "arithmetic"),
+    ("possible array index out of bounds", "bounds"),
+    ("cannot show this call will not unwind", "unwind"),
+    (
+        "may fail to meet its declared type invariant",
+        "type-invariant",
+    ),
 ];
 
-/// Kind label for each entry of `PROOF_DIAGNOSTICS`, in the same order.
-const DIAGNOSTIC_KINDS: &[&str] = &[
-    "postcondition",
-    "precondition",
-    "precondition",
-    "invariant",
-    "assertion",
-    "decreases",
-    "division",
-    "arithmetic",
-    "arithmetic",
-    "bounds",
-    "other",
-];
+fn diagnostic(message: &str) -> Option<(&'static str, &'static str)> {
+    PROOF_DIAGNOSTICS
+        .iter()
+        .find(|(pattern, _)| message.contains(pattern))
+        .copied()
+}
 
 pub fn proof_failure(output: &str) -> Option<&'static str> {
-    if let Some(pattern) = PROOF_DIAGNOSTICS
-        .iter()
-        .find(|pattern| output.contains(**pattern))
-    {
+    if let Some((pattern, _)) = diagnostic(output) {
         return Some(pattern);
     }
     // Verus prints a `verification results:: N verified, M errors` line only
@@ -59,11 +64,7 @@ pub fn kill_location(output: &str) -> Option<KillLocation> {
         let Some(message) = line.strip_prefix("error: ") else {
             continue;
         };
-        let Some(kind) = PROOF_DIAGNOSTICS
-            .iter()
-            .position(|pattern| message.starts_with(pattern))
-            .map(|index| DIAGNOSTIC_KINDS[index])
-        else {
+        let Some((_, kind)) = diagnostic(message) else {
             continue;
         };
         let Some(arrow) = lines
@@ -138,6 +139,41 @@ mod tests {
         let kill = kill_location(body).unwrap();
         assert!(!kill.from_ensures);
         assert_eq!((kill.kind.as_str(), kill.line), ("assertion", 677));
+
+        // Verus 0.2026.08.30 output for a mutant inside an invariant block.
+        let block = "   Compiling app v0.0.0 (/w/source/app)\n\
+                     error: Cannot show invariant holds at end of block\n    \
+                     --> app/src/lib.rs:623:5\n     |\n\
+                     623 | /     open_atomic_invariant!(q.inv.borrow() => g => {\n\n\
+                     verification results:: 64 verified, 1 errors\n";
+        let kill = kill_location(block).unwrap();
+        assert_eq!(
+            (kill.kind.as_str(), kill.line, kill.column),
+            ("invariant", 623, 5)
+        );
+        assert_eq!(kill.file, "app/src/lib.rs");
+        for (message, kind) in [
+            ("loop invariant not satisfied", "invariant"),
+            ("invariant not satisfied before loop", "invariant"),
+            ("cannot show the atomic update was committed", "atomic"),
+            (
+                "cannot show atomic postcondition hold at end of block",
+                "atomic",
+            ),
+            ("assertion failure", "assertion"),
+            (
+                "value may fail to meet its declared type invariant after assignment",
+                "type-invariant",
+            ),
+        ] {
+            let output = format!("error: {message}\n  --> src/a.rs:3:4\n");
+            assert_eq!(
+                kill_location(&output).map(|k| k.kind),
+                Some(kind.to_owned()),
+                "{message}"
+            );
+            assert!(super::proof_failure(&output).is_some(), "{message}");
+        }
 
         // A compile error is not a located kill.
         assert!(kill_location("error[E0308]: mismatched types\n --> src/a.rs:1:1").is_none());
