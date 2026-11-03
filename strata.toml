@@ -1,0 +1,88 @@
+# Module layering of cargo-verus-mutants, checked by `cargo strata check`
+# (cargo-strata 0.4.0) in CI. Each rule states a design decision; change a rule
+# on purpose, in the same commit as the code that needs it.
+check_dev = true
+
+[[crate]]
+name = "cargo-verus-mutants"
+allow = []
+
+# The mutant, oracle and result model is the vocabulary every layer shares.
+# It depends on nothing.
+[[crate.module]]
+path = "model"
+depends_on = []
+
+# Verus-release-specific output knowledge: one adapter per output-format
+# generation. Adapters produce model types only and never reference each
+# other, so supporting a release never edits another release's adapter.
+[[crate.module]]
+path = "adapters::*"
+depends_on = ["model"]
+deny = ["adapters::*"]
+
+# The one dispatch point over the adapters.
+[[crate.module]]
+path = "adapters"
+depends_on = ["model"]
+
+# Classifies oracle output; the only module that consults the adapters, and
+# only through the dispatch point.
+[[crate.module]]
+path = "oracle"
+depends_on = ["adapters", "config", "model", "process"]
+deny = ["adapters::*"]
+
+# Process groups, timeouts and interrupts: generic, knows nothing of Verus.
+[[crate.module]]
+path = "process"
+depends_on = []
+
+# Source discovery parses Verus syntax into mutants; it never runs anything.
+[[crate.module]]
+path = "discover"
+depends_on = ["cargo", "config", "model"]
+
+[[crate.module]]
+path = "rust"
+depends_on = ["config", "model"]
+
+[[crate.module]]
+path = "cargo"
+depends_on = []
+
+[[crate.module]]
+path = "config"
+depends_on = ["cargo", "model"]
+
+[[crate.module]]
+path = "materialize"
+depends_on = ["model"]
+
+[[crate.module]]
+path = "baseline"
+depends_on = ["model"]
+
+# Reports render results; they never classify output or run commands.
+[[crate.module]]
+path = "report"
+depends_on = ["model"]
+
+# The orchestrator. It reaches Verus output only through `oracle`.
+[[crate.module]]
+path = "runner"
+depends_on = ["baseline", "cargo", "config", "discover", "materialize", "model", "oracle", "report", "rust"]
+
+# Source syntax: one `verus_syn` release parses every supported Verus release,
+# and only discovery may use it.
+[[forbid]]
+name = "verus-syntax"
+patterns = ["verus_syn"]
+allow = ["src/discover.rs"]
+
+# Oracle commands must stop their whole process group on timeout; waiting on a
+# child anywhere else would bring back orphaned verifier processes.
+[[forbid]]
+name = "process-timeouts"
+patterns = ["wait_timeout", "libc", "unsafe"]
+allow = ["src/process.rs"]

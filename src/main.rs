@@ -1,3 +1,4 @@
+mod adapters;
 mod baseline;
 mod cargo;
 mod config;
@@ -13,10 +14,14 @@ mod rust;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "cargo-verus-mutants", bin_name = "cargo verus-mutants")]
+#[command(
+    name = "cargo-verus-mutants",
+    bin_name = "cargo verus-mutants",
+    version
+)]
 #[command(about = "Mutation analysis for Verus Cargo projects")]
 struct Cli {
     #[command(subcommand)]
@@ -101,7 +106,12 @@ fn main() -> Result<()> {
     if args.get(1).is_some_and(|arg| arg == "verus-mutants") {
         args.remove(1);
     }
-    let cli = Cli::parse_from(args);
+    // `--version` also names the Verus releases the tool supports.
+    let long_version: &'static str = Box::leak(adapters::long_version().into_boxed_str());
+    let matches = Cli::command()
+        .long_version(long_version)
+        .get_matches_from(args);
+    let cli = Cli::from_arg_matches(&matches)?;
     match cli.command.unwrap_or_else(|| {
         Command::Run(Box::new(RunArgs {
             common: CommonArgs {
