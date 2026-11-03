@@ -1,80 +1,33 @@
 //! End-to-end redundancy campaign on `tests/fixtures/redundancy`, verified by
-//! real Verus. Ignored by default because it needs a Verus toolchain: set
-//! `VERUS_FIXTURE_VERIFY` to an executable that runs `cargo verus build "$@"`
-//! in its working directory (for example a container wrapper), then run
-//! `cargo test --test redundancy_e2e -- --ignored`.
+//! real Verus. Ignored by default; see `tests/common/mod.rs` for the
+//! environment, then run `cargo test --test redundancy_e2e -- --ignored`.
 
-use std::fs;
-use std::path::Path;
-use std::process::Command;
-
-fn copy_dir(from: &Path, to: &Path) {
-    fs::create_dir_all(to).unwrap();
-    for entry in fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let target = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &target);
-        } else {
-            fs::copy(entry.path(), target).unwrap();
-        }
-    }
-}
+mod common;
 
 #[test]
 #[ignore = "needs a Verus toolchain (VERUS_FIXTURE_VERIFY)"]
 fn redundancy_findings_and_non_findings() {
-    let verify = std::env::var("VERUS_FIXTURE_VERIFY").expect("VERUS_FIXTURE_VERIFY");
-    let project = tempfile::tempdir().unwrap();
-    copy_dir(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/redundancy"),
+    let project = common::fixture_project("redundancy");
+    let (success, results) = common::run(
         project.path(),
+        &[
+            "--automatic-only",
+            "--redundancy",
+            "--operator",
+            "drop-requires",
+            "--operator",
+            "drop-ensures",
+            "--operator",
+            "dead-refusal",
+        ],
     );
-    fs::write(
-        project.path().join(".verus-mutants.toml"),
-        format!(
-            "[verification]\ncommand = [{verify:?}, \"-p\", \"{{package}}\"]\ntimeout_seconds = 900\n"
-        ),
-    )
-    .unwrap();
-    let status = Command::new(env!("CARGO_BIN_EXE_cargo-verus-mutants"))
-        .args(["run", "--automatic-only", "--redundancy"])
-        .args(["--operator", "drop-requires", "--operator", "drop-ensures"])
-        .args(["--operator", "dead-refusal"])
-        .current_dir(project.path())
-        .status()
-        .unwrap();
-    assert!(
-        status.success(),
-        "redundancy findings must not fail the run"
-    );
-    let summary: serde_json::Value = serde_json::from_slice(
-        &fs::read(project.path().join("target/verus-mutants/summary.json")).unwrap(),
-    )
-    .unwrap();
-    let mut verdicts: Vec<(String, String)> = summary["results"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| {
-            let mutant = &r["mutant"];
-            (
-                format!(
-                    "{}:{}",
-                    mutant["function"].as_str().unwrap(),
-                    mutant["detail"].as_str().unwrap()
-                ),
-                r["outcome"].as_str().unwrap().to_owned(),
-            )
-        })
-        .collect();
-    verdicts.sort();
+    assert!(success, "redundancy findings must not fail the run");
     let outcome = |key: &str| {
-        verdicts
+        results
             .iter()
-            .find(|(name, _)| name == key)
-            .unwrap_or_else(|| panic!("no mutant {key}: {verdicts:?}"))
-            .1
+            .find(|(function, _, detail, _)| format!("{function}:{detail}") == key)
+            .unwrap_or_else(|| panic!("no mutant {key}: {results:?}"))
+            .3
             .as_str()
     };
     // Findings.
