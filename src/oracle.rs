@@ -433,13 +433,18 @@ pub fn kill_location(output: &str) -> Option<KillLocation> {
     None
 }
 
-/// The error count from Verus's `verification results::` summary line.
+/// The largest error count among Verus's `verification results::` summary
+/// lines. A command that verifies several crates prints one line per crate,
+/// and the failing crate need not come first.
 fn verification_errors(output: &str) -> Option<usize> {
-    output.lines().find_map(|line| {
-        let rest = line.strip_prefix("verification results:: ")?;
-        let (_, errors) = rest.split_once(" verified, ")?;
-        errors.split_whitespace().next()?.parse().ok()
-    })
+    output
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("verification results:: ")?;
+            let (_, errors) = rest.split_once(" verified, ")?;
+            errors.split_whitespace().next()?.parse().ok()
+        })
+        .max()
 }
 
 fn looks_invalid(output: &str) -> bool {
@@ -576,6 +581,19 @@ mod tests {
             "error[E0425]: cannot find value `g` in this scope",
         );
         assert_eq!(result.0, Outcome::Invalid);
+    }
+
+    /// `cargo verus build` prints one summary per verified crate, dependencies
+    /// first. A failure in a later crate is still a proof kill, not an invalid
+    /// mutant because cargo also says `could not compile`.
+    #[test]
+    fn a_later_failing_summary_line_is_a_proof_kill() {
+        let output = "verification results:: 2045 verified, 0 errors\n\
+                      error: some future diagnostic\n\
+                      verification results:: 3 verified, 1 errors\n\
+                      error: could not compile `app` (lib) due to 1 previous error";
+        let result = classify(&mutant(OracleKind::Verus), Some(101), false, output);
+        assert_eq!(result.0, Outcome::KilledByProof);
     }
 
     #[test]
