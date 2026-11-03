@@ -731,6 +731,40 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
     fn visit_assume(&mut self, _node: &'ast Assume) {}
 
     fn visit_reveal_hide(&mut self, _node: &'ast RevealHide) {}
+
+    /// Other macro bodies are opaque token trees, except the executable
+    /// invariant-opening macros: their block runs in exec mode and usually
+    /// holds an object's atomic linearization point, so it is mutated like any
+    /// other exec block. The `*_in_proof` variants only occur in proof code,
+    /// which is never visited.
+    fn visit_macro(&mut self, node: &'ast verus_syn::Macro) {
+        if self.function.is_some() && is_exec_invariant_macro(&node.path) {
+            if let Some(block) = invariant_macro_block(&node.tokens) {
+                self.visit_block(&block);
+            }
+        }
+    }
+}
+
+/// `open_atomic_invariant!` and `open_local_invariant!`, under any path prefix.
+fn is_exec_invariant_macro(path: &verus_syn::Path) -> bool {
+    path.segments.last().is_some_and(|segment| {
+        segment.ident == "open_atomic_invariant" || segment.ident == "open_local_invariant"
+    })
+}
+
+/// The block of an invariant-opening macro, `[credit =>] inv => binding => { .. }`:
+/// the token trees after the last top-level `=>`. The tokens keep their source
+/// spans, so mutants inside map back to the file.
+fn invariant_macro_block(tokens: &proc_macro2::TokenStream) -> Option<Block> {
+    use proc_macro2::{Spacing, TokenTree};
+    let trees: Vec<TokenTree> = tokens.clone().into_iter().collect();
+    let arrow = trees.windows(2).rposition(|pair| {
+        matches!(&pair[0], TokenTree::Punct(p) if p.as_char() == '=' && p.spacing() == Spacing::Joint)
+            && matches!(&pair[1], TokenTree::Punct(p) if p.as_char() == '>')
+    })?;
+    let body: proc_macro2::TokenStream = trees[arrow + 2..].iter().cloned().collect();
+    verus_syn::parse2::<Block>(body).ok()
 }
 
 /// True when two expressions have the same type by syntax alone: literals of
@@ -1127,6 +1161,72 @@ mod tests { fn inner(x: u32) -> u32 { x + 11 } }
             .collect();
         let expected: BTreeSet<_> = ["5", "8", "10"].into_iter().collect();
         assert_eq!(touched, expected);
+    }
+
+    /// Current Verus syntax: logically atomic functions (`atomically (au) {..}`
+    /// signatures and `atomically |update| {..}` call sites), exec invariant
+    /// blocks, `#[verifier::exec_allows_no_decreases_clause]`,
+    /// `#[verifier::spinoff_prover]`, and tracked and ghost parameters.
+    #[test]
+    fn current_verus_syntax_mutates_exec_code_inside_invariant_blocks_only() {
+        let source = include_str!("../tests/fixtures/syntax/atomic.rs");
+        let mutants = discover_source(source, &OperatorsConfig::default());
+        let found: BTreeSet<_> = mutants
+            .iter()
+            .map(|m| {
+                let line = source[..m.start].lines().count();
+                (
+                    m.function.clone().unwrap(),
+                    line,
+                    m.operator.as_str(),
+                    m.original.as_str(),
+                )
+            })
+            .collect();
+        let expected: BTreeSet<_> = [
+            ("enq", 19, "replace-integer-literal", "0"),
+            // Inside `open_atomic_invariant!`: the load, the guard and the store.
+            (
+                "enq",
+                21,
+                "delete-executable-statement",
+                "v = q.cell.load(Tracked(&g.perm));",
+            ),
+            ("enq", 22, "condition-to-true", "v == 3"),
+            ("enq", 22, "condition-to-false", "v == 3"),
+            ("enq", 22, "replace-relational-operator", "=="),
+            ("enq", 22, "replace-integer-literal", "3"),
+            (
+                "enq",
+                23,
+                "delete-executable-statement",
+                "q.cell.store(Tracked(&mut g.perm), v + 1);",
+            ),
+            ("enq", 23, "replace-arithmetic-operator", "+"),
+            ("enq", 23, "replace-integer-literal", "1"),
+            ("spin_wait", 40, "condition-to-true", "q.flag.load() != 0"),
+            ("spin_wait", 40, "condition-to-false", "q.flag.load() != 0"),
+            ("spin_wait", 40, "replace-relational-operator", "!="),
+            ("spin_wait", 40, "replace-integer-literal", "0"),
+            ("spin_wait", 43, "delete-executable-statement", "q.hint();"),
+            ("heavy", 52, "replace-arithmetic-operator", "+"),
+            ("heavy", 52, "replace-integer-literal", "1"),
+            // `open_local_invariant!` is exec too; `*_in_proof` is not visited.
+            (
+                "invariant_in_proof",
+                62,
+                "delete-executable-statement",
+                "q.cell.store(Tracked(&mut g.perm), 7);",
+            ),
+            ("invariant_in_proof", 62, "replace-integer-literal", "7"),
+        ]
+        .into_iter()
+        .map(|(f, l, o, t)| (f.to_string(), l, o, t))
+        .collect();
+        assert_eq!(found, expected);
+        for mutant in &mutants {
+            verus_syn::parse_file(&apply_to(source, mutant)).expect("mutant parses");
+        }
     }
 
     fn redundancy_operators() -> OperatorsConfig {
