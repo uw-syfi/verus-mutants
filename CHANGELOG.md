@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1
+
+- A failing or timed-out baseline now writes its whole output to
+  `target/verus-mutants/logs/baseline-worker-N-<key>.log`, as a passing one
+  always did. The error names the log and quotes the output from its first
+  `error` line instead of the last 4000 bytes, which for Verus were often
+  only trigger notes printed after the errors.
+
 ## 0.3.0
 
 Verus support:

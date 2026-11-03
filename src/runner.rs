@@ -337,17 +337,14 @@ fn execute_worker(
     for (key, baseline) in &commands {
         let command = &baseline.command;
         eprintln!("worker {worker} baseline: {}", command.join(" "));
-        let output = oracle::baseline(
+        oracle::baseline(
             &source,
             &target,
             command,
             verification.timeout_seconds,
             &baseline.kind,
             baseline.required_test_count,
-        )?;
-        fs::write(
-            log_root.join(format!("baseline-worker-{worker}-{key}.log")),
-            output,
+            &log_root.join(format!("baseline-worker-{worker}-{key}.log")),
         )?;
     }
 

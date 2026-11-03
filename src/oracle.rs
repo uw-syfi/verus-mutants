@@ -191,6 +191,11 @@ pub fn execute_redundancy(
     ))
 }
 
+/// Runs a clean baseline and writes its whole output to `log`, whether it
+/// passes or not, so a failing baseline can be diagnosed from the file. A
+/// failure's error names the log and quotes the output from its first
+/// `error` line (compilers and Verus print notes after the errors, so the
+/// tail alone often shows none).
 pub fn baseline(
     source: &std::path::Path,
     target: &std::path::Path,
@@ -198,20 +203,30 @@ pub fn baseline(
     timeout_seconds: u64,
     kind: &OracleKind,
     required_test_count: Option<usize>,
+    log: &std::path::Path,
 ) -> Result<String> {
     let raw = run_process(source, target, command, timeout_seconds)?;
-    anyhow::ensure!(!raw.timed_out, "baseline timed out: {}", command.join(" "));
+    fs::write(log, &raw.output)
+        .with_context(|| format!("writing baseline log {}", log.display()))?;
+    anyhow::ensure!(
+        !raw.timed_out,
+        "baseline timed out: {}\nfull output: {}",
+        command.join(" "),
+        log.display()
+    );
     anyhow::ensure!(
         raw.returncode == Some(0),
-        "baseline failed: {}\n{}",
+        "baseline failed: {}\nfull output: {}\n{}",
         command.join(" "),
-        tail(&raw.output, 4000)
+        log.display(),
+        error_excerpt(&raw.output, 4000)
     );
     if kind == &OracleKind::Verus {
         anyhow::ensure!(
             adapters::has_positive_verification(&raw.output),
-            "Verus baseline completed without a positive verification summary: {}",
-            command.join(" ")
+            "Verus baseline completed without a positive verification summary: {}\nfull output: {}",
+            command.join(" "),
+            log.display()
         );
     }
     if kind == &OracleKind::Test {
@@ -369,6 +384,26 @@ fn first_error(output: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// At most `bytes` of `text` from its first line that starts with `error`,
+/// or its tail when no line does.
+fn error_excerpt(text: &str, bytes: usize) -> &str {
+    let start = text
+        .match_indices("error")
+        .map(|(i, _)| i)
+        .find(|&i| i == 0 || text.as_bytes()[i - 1] == b'\n');
+    match start {
+        Some(i) => {
+            let rest = &text[i..];
+            let mut end = rest.len().min(bytes);
+            while !rest.is_char_boundary(end) {
+                end -= 1;
+            }
+            &rest[..end]
+        }
+        None => tail(text, bytes),
+    }
+}
+
 fn tail(text: &str, bytes: usize) -> &str {
     if text.len() <= bytes {
         text
@@ -383,7 +418,7 @@ fn tail(text: &str, bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_paths, classify, expand, passed_test_count};
+    use super::{baseline, bind_paths, classify, error_excerpt, expand, passed_test_count};
     use crate::model::{Campaign, Mutant, OracleKind, OracleSpec, Outcome};
     use std::path::PathBuf;
 
@@ -577,5 +612,72 @@ mod tests {
                 .unwrap();
         assert_eq!(execution.outcome, Outcome::KilledByProof);
         assert_eq!(ran, ["a", "bad"], "stops at the first failing package");
+    }
+
+    #[test]
+    fn a_failing_baseline_keeps_its_whole_output_and_quotes_the_first_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("baseline.log");
+        // Errors first, then more notes than the quoted excerpt holds.
+        let script = "echo 'warning: unused'; echo 'error: assertion failed'; \
+                      echo ' --> src/lib.rs:3:5'; i=0; while [ $i -lt 600 ]; do \
+                      echo 'note: automatically chose triggers'; i=$((i+1)); done; exit 101";
+        let command = ["sh", "-c", script].map(String::from);
+        let err = baseline(
+            dir.path(),
+            &dir.path().join("target"),
+            &command,
+            60,
+            &OracleKind::Verus,
+            None,
+            &log,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("error: assertion failed\n --> src/lib.rs:3:5"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("full output: {}", log.display())),
+            "{err}"
+        );
+        let saved = std::fs::read_to_string(&log).unwrap();
+        assert!(saved.starts_with("warning: unused\nerror: assertion failed\n"));
+        assert_eq!(
+            saved.matches("note: automatically chose triggers").count(),
+            600
+        );
+
+        // A passing baseline is logged too.
+        let ok = [
+            "sh",
+            "-c",
+            "echo 'verification results:: 3 verified, 0 errors'",
+        ]
+        .map(String::from);
+        baseline(
+            dir.path(),
+            &dir.path().join("target"),
+            &ok,
+            60,
+            &OracleKind::Verus,
+            None,
+            &log,
+        )
+        .unwrap();
+        assert!(std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("3 verified"));
+    }
+
+    #[test]
+    fn the_excerpt_starts_at_an_error_line_or_falls_back_to_the_tail() {
+        assert_eq!(
+            error_excerpt("note: a\nerror: b\nnote: c\n", 100),
+            "error: b\nnote: c\n"
+        );
+        assert_eq!(error_excerpt("an error inside a line\nlast", 4), "last");
+        assert_eq!(error_excerpt("error: ééé", 9), "error: é");
     }
 }
