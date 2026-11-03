@@ -695,7 +695,17 @@ impl<'ast> Visit<'ast> for ExecVisitor<'_> {
         }
         if self.operators.match_arm_body_substitution && node.arms.len() > 1 {
             for (index, arm) in node.arms.iter().enumerate() {
-                let replacement = &node.arms[(index + 1) % node.arms.len()].body;
+                let next = &node.arms[(index + 1) % node.arms.len()];
+                let replacement = &next.body;
+                // A body that names its own arm's bindings (`Some(x) => x`)
+                // does not compile in an arm that does not bind them.
+                let needed = pattern_bindings(&next.pat);
+                let available = pattern_bindings(&arm.pat);
+                let body = span_text(self.source, replacement.span());
+                if identifiers(&body).any(|name| needed.contains(name) && !available.contains(name))
+                {
+                    continue;
+                }
                 if let Some((start, end)) = byte_range(self.source, replacement.span()) {
                     self.add(
                         arm.body.span(),
@@ -794,6 +804,30 @@ fn evidently_same_type(left: &Expr, right: &Expr, source: &str) -> bool {
         return a == b;
     }
     matches!((cast_type(left, source), cast_type(right, source)), (Some(a), Some(b)) if a == b)
+}
+
+/// Names a match pattern binds. Capitalized identifiers are taken for unit
+/// variants and constants (`None`, `MAX`), as rustc's lint convention has it.
+fn pattern_bindings(pattern: &Pat) -> BTreeSet<String> {
+    struct Bindings(BTreeSet<String>);
+    impl<'ast> Visit<'ast> for Bindings {
+        fn visit_pat_ident(&mut self, node: &'ast verus_syn::PatIdent) {
+            let name = node.ident.to_string();
+            if !name.starts_with(|c: char| c.is_uppercase()) {
+                self.0.insert(name);
+            }
+            visit::visit_pat_ident(self, node);
+        }
+    }
+    let mut bindings = Bindings(BTreeSet::new());
+    bindings.visit_pat(pattern);
+    bindings.0
+}
+
+/// Identifier-like words of a source text.
+fn identifiers(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|word| word.starts_with(|c: char| c.is_alphabetic() || c == '_'))
 }
 
 /// `Ghost(..)` and `Tracked(..)` constructor calls.
@@ -1227,6 +1261,29 @@ mod tests { fn inner(x: u32) -> u32 { x + 11 } }
         for mutant in &mutants {
             verus_syn::parse_file(&apply_to(source, mutant)).expect("mutant parses");
         }
+    }
+
+    #[test]
+    fn match_arm_substitution_skips_bodies_that_need_other_bindings() {
+        let source = r#"verus! {
+fn f(o: Option<u32>, r: Result<u32, u32>) -> u32 {
+    let a = match o { Some(x) => x, None => 0 };
+    let b = match r { Ok(x) => x + 1, Err(x) => x };
+    a + b
+}
+}
+"#;
+        let swaps: Vec<_> = discover_source(source, &OperatorsConfig::default())
+            .into_iter()
+            .filter(|m| m.operator == "substitute-match-arm-body")
+            .map(|m| (m.original, m.replacement))
+            .collect();
+        // `None => x` would not compile; `Some(x) => 0` and both `Ok`/`Err`
+        // swaps (each binds `x`) do.
+        let expected: Vec<(String, String)> = [("x", "0"), ("x + 1", "x"), ("x", "x + 1")]
+            .map(|(a, b)| (a.to_owned(), b.to_owned()))
+            .to_vec();
+        assert_eq!(swaps, expected);
     }
 
     fn redundancy_operators() -> OperatorsConfig {
